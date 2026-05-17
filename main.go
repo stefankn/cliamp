@@ -13,6 +13,7 @@ import (
 	"cliamp/applog"
 	"cliamp/config"
 	"cliamp/external/emby"
+	"cliamp/external/finch"
 	"cliamp/external/jellyfin"
 	"cliamp/external/local"
 	"cliamp/external/navidrome"
@@ -160,6 +161,18 @@ func run(overrides config.Overrides, positional []string, daemon bool) error {
 		}
 	}
 
+	if cfg.Finch.URL != "" {
+		finchProv := finch.New(finch.Config{
+			URL: cfg.Finch.URL,
+		})
+		providers = append(providers, model.ProviderEntry{
+			Key:      "finch",
+			Name:     "Finch",
+			Provider: finchProv,
+		})
+
+	}
+
 	if spotifyProv != nil {
 		defer spotifyProv.Close()
 	}
@@ -238,7 +251,7 @@ func run(overrides config.Overrides, positional []string, daemon bool) error {
 	}
 
 	p.RegisterBufferedURLMatcher(func(u string) bool {
-		return navidrome.IsSubsonicStreamURL(u) || jellyfin.IsStreamURL(u) || emby.IsStreamURL(u) || plex.IsStreamURL(u)
+		return navidrome.IsSubsonicStreamURL(u) || jellyfin.IsStreamURL(u) || emby.IsStreamURL(u) || plex.IsStreamURL(u) || strings.HasPrefix(u, strings.TrimRight(cfg.Finch.URL, "/"))
 	})
 
 	cfg.ApplyPlayer(p)

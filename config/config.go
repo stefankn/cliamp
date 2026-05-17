@@ -216,6 +216,11 @@ func (e EmbyConfig) IsSet() bool {
 	return e.URL != "" && (e.Token != "" || (e.User != "" && e.Password != ""))
 }
 
+// FinchConfig holds settings for the Finch provider
+type FinchConfig struct {
+	URL string
+}
+
 // Config holds user preferences loaded from the config file.
 type Config struct {
 	Volume           float64     // dB, range [-30, +6]
@@ -227,7 +232,7 @@ type Config struct {
 	Speed            float64                      // playback speed ratio: 0.25–2.0 (default 1.0)
 	AutoPlay         bool                         // start playback automatically on launch (radio streams, CLI tracks)
 	SeekStepLarge    int                          // seconds for Shift+Left/Right seek jumps
-	Provider         string                       // default provider: "radio", "navidrome", "spotify", "plex", "jellyfin", "emby", "soundcloud", "netease", "ytmusic" (default "radio")
+	Provider         string                       // default provider: "radio", "navidrome", "spotify", "plex", "jellyfin", "emby", "soundcloud", "netease", "ytmusic", "finch" (default "radio")
 	Theme            string                       // theme name, or "" for ANSI default
 	Visualizer       string                       // visualizer mode name, or "" for default (Bars)
 	SampleRate       int                          // output sample rate: 22050, 44100, 48000, 96000, 192000
@@ -248,6 +253,7 @@ type Config struct {
 	Emby             EmbyConfig                   // optional Emby server credentials
 	SoundCloud       SoundCloudConfig             // SoundCloud provider (opt-in via enabled = true)
 	NetEase          NetEaseConfig                // NetEase Cloud Music provider (opt-in via enabled = true)
+	Finch            FinchConfig                  // optional Finch provider
 	Plugins          map[string]map[string]string // per-plugin config from [plugins.*] sections
 	LogLevel         string                       // log level: debug, info, warn, error (default "info")
 }
@@ -424,6 +430,11 @@ func Load() (Config, error) {
 				cfg.Emby.Password = parseString(val)
 			case "user_id":
 				cfg.Emby.UserID = parseString(val)
+			}
+		case "finch":
+			switch key {
+			case "url":
+				cfg.Finch.URL = parseString(val)
 			}
 		default:
 			// Handle [plugins] and [plugins.*] sections.

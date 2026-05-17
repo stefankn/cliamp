@@ -150,10 +150,10 @@ func overridesFromFlags(c *cli.Command) (config.Overrides, error) {
 	if c.IsSet("provider") {
 		v := strings.ToLower(c.String("provider"))
 		switch v {
-		case "radio", "navidrome", "spotify", "plex", "jellyfin", "emby", "soundcloud", "netease", "yt", "youtube", "ytmusic":
+		case "radio", "navidrome", "spotify", "plex", "jellyfin", "emby", "soundcloud", "netease", "yt", "youtube", "ytmusic", "finch":
 			ov.Provider = &v
 		default:
-			return ov, fmt.Errorf("--provider must be radio, navidrome, spotify, plex, jellyfin, emby, soundcloud, netease, yt, youtube, or ytmusic (got %q)", v)
+			return ov, fmt.Errorf("--provider must be radio, navidrome, spotify, plex, jellyfin, emby, soundcloud, netease, yt, youtube, ytmusic or finch (got %q)", v)
 		}
 	}
 	if c.IsSet("start-theme") {
