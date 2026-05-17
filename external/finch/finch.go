@@ -170,111 +170,51 @@ func (p *Provider) Tracks(id string) ([]playlist.Track, error) {
 	return result, nil
 }
 
-func (p *Provider) fetchAlbums() ([]album, error) {
-	u, err := url.Parse(strings.TrimRight(p.cfg.URL, "/") + "/api/v1/albums")
+// get performs a GET request to the given API path, decodes the JSON response
+// into T, and returns it. params may be nil if no query parameters are needed.
+func get[T any](p *Provider, path string, params url.Values) (T, error) {
+	var zero T
+	u, err := url.Parse(strings.TrimRight(p.cfg.URL, "/") + path)
 	if err != nil {
-		return nil, fmt.Errorf("finch: parse url: %w", err)
+		return zero, fmt.Errorf("finch: parse url: %w", err)
 	}
-
-	q := u.Query()
-	q.Set("per", "10000")
-	u.RawQuery = q.Encode()
+	if params != nil {
+		u.RawQuery = params.Encode()
+	}
 
 	resp, err := p.client.Get(u.String())
 	if err != nil {
-		return nil, fmt.Errorf("finch: GET %s: %w", u, err)
+		return zero, fmt.Errorf("finch: GET %s: %w", u, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("finch: unexpected status %d from %s", resp.StatusCode, u)
+		return zero, fmt.Errorf("finch: unexpected status %d from %s", resp.StatusCode, u)
 	}
 
-	var result albumResponse
+	var result T
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("finch: decode albums response: %w", err)
+		return zero, fmt.Errorf("finch: decode response from %s: %w", u, err)
 	}
-
-	return result.Albums, nil
+	return result, nil
 }
 
-func (p *Provider) fetchItems(albumId string) ([]item, error) {
-	u, err := url.Parse(strings.TrimRight(p.cfg.URL, "/") + "/api/v1/albums/" + albumId + "/items")
+func (p *Provider) fetchAlbums() ([]album, error) {
+	r, err := get[albumResponse](p, "/api/v1/albums", url.Values{"per": {"10000"}})
 	if err != nil {
-		return nil, fmt.Errorf("finch: parse url: %w", err)
+		return nil, err
 	}
+	return r.Albums, nil
+}
 
-	q := u.Query()
-	u.RawQuery = q.Encode()
-
-	resp, err := p.client.Get(u.String())
-	if err != nil {
-		return nil, fmt.Errorf("finch: GET %s: %w", u, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("finch: unexpected status %d from %s", resp.StatusCode, u)
-	}
-
-	var result []item
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("finch: decode items response: %w", err)
-	}
-
-	return result, nil
+func (p *Provider) fetchItems(albumID string) ([]item, error) {
+	return get[[]item](p, "/api/v1/albums/"+albumID+"/items", nil)
 }
 
 func (p *Provider) fetchPlaylists() ([]playlistResponse, error) {
-	u, err := url.Parse(strings.TrimRight(p.cfg.URL, "/") + "/api/v1/playlists")
-	if err != nil {
-		return nil, fmt.Errorf("finch: parse url: %w", err)
-	}
-
-	q := u.Query()
-	u.RawQuery = q.Encode()
-
-	resp, err := p.client.Get(u.String())
-	if err != nil {
-		return nil, fmt.Errorf("finch: GET %s: %w", u, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("finch: unexpected status %d from %s", resp.StatusCode, u)
-	}
-
-	var result []playlistResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("finch: decode playlists response: %w", err)
-	}
-
-	return result, nil
+	return get[[]playlistResponse](p, "/api/v1/playlists", nil)
 }
 
-func (p *Provider) fetchPlaylistItems(playlistId string) ([]playlistEntry, error) {
-	u, err := url.Parse(strings.TrimRight(p.cfg.URL, "/") + "/api/v1/playlists/" + playlistId + "/entries")
-	if err != nil {
-		return nil, fmt.Errorf("finch: parse url: %w", err)
-	}
-
-	q := u.Query()
-	u.RawQuery = q.Encode()
-
-	resp, err := p.client.Get(u.String())
-	if err != nil {
-		return nil, fmt.Errorf("finch: GET %s: %w", u, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("finch: unexpected status %d from %s", resp.StatusCode, u)
-	}
-
-	var result []playlistEntry
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("finch: decode playlist entries response: %w", err)
-	}
-
-	return result, err
+func (p *Provider) fetchPlaylistItems(playlistID string) ([]playlistEntry, error) {
+	return get[[]playlistEntry](p, "/api/v1/playlists/"+playlistID+"/entries", nil)
 }
