@@ -37,6 +37,10 @@ type albumResponse struct {
 	Albums []album `json:"items"`
 }
 
+type itemsResponse struct {
+	Items []item `json:"items"`
+}
+
 type album struct {
 	ID     int    `json:"id"`
 	Title  string `json:"title"`
@@ -81,6 +85,10 @@ func (p *Provider) Playlists() ([]playlist.PlaylistInfo, error) {
 		playlists []playlistResponse
 		err       error
 	}
+	type djMixesResult struct {
+		djmixes []item
+		err     error
+	}
 
 	albumsCh := make(chan albumsResult, 1)
 	playlistsCh := make(chan playlistsResult, 1)
@@ -119,6 +127,18 @@ func (p *Provider) Playlists() ([]playlist.PlaylistInfo, error) {
 			Section: "Playlists",
 		})
 	}
+
+	result = append(result, playlist.PlaylistInfo{
+		ID:      "djmixes",
+		Name:    "DJ mixes",
+		Section: "Playlists",
+	})
+
+	result = append(result, playlist.PlaylistInfo{
+		ID:      "tracks",
+		Name:    "Tracks",
+		Section: "Playlists",
+	})
 
 	return result, nil
 }
@@ -163,6 +183,40 @@ func (p *Provider) Tracks(id string) ([]playlist.Track, error) {
 				Genre:        e.Item.Genre,
 			})
 		}
+	case strings.HasPrefix(id, "djmixes"):
+		items, err := p.fetchDjMixes()
+		if err != nil {
+			return nil, err
+		}
+		for _, i := range items {
+			result = append(result, playlist.Track{
+				Path:         p.cfg.URL + "/api/v1/items/" + strconv.Itoa(i.ID) + "/stream",
+				Title:        i.Title,
+				Artist:       i.Artist,
+				Album:        "DJ mix",
+				Stream:       true, // true for HTTP/HTTPS URLs
+				Realtime:     false,
+				DurationSecs: int(i.Duration),
+				Genre:        i.Genre,
+			})
+		}
+	case strings.HasPrefix(id, "tracks"):
+		items, err := p.fetchSingletonTracks()
+		if err != nil {
+			return nil, err
+		}
+		for _, i := range items {
+			result = append(result, playlist.Track{
+				Path:         p.cfg.URL + "/api/v1/items/" + strconv.Itoa(i.ID) + "/stream",
+				Title:        i.Title,
+				Artist:       i.Artist,
+				Album:        "Tracks",
+				Stream:       true, // true for HTTP/HTTPS URLs
+				Realtime:     false,
+				DurationSecs: int(i.Duration),
+				Genre:        i.Genre,
+			})
+		}
 	default:
 		return nil, fmt.Errorf("finch: unknown id format: %s", id)
 	}
@@ -205,6 +259,22 @@ func (p *Provider) fetchAlbums() ([]album, error) {
 		return nil, err
 	}
 	return r.Albums, nil
+}
+
+func (p *Provider) fetchDjMixes() ([]item, error) {
+	r, err := get[itemsResponse](p, "/api/v1/items", url.Values{"filter": {"dj-mix"}, "per": {"10000"}})
+	if err != nil {
+		return nil, err
+	}
+	return r.Items, nil
+}
+
+func (p *Provider) fetchSingletonTracks() ([]item, error) {
+	r, err := get[itemsResponse](p, "/api/v1/items", url.Values{"filter": {"uncategorized"}, "per": {"10000"}})
+	if err != nil {
+		return nil, err
+	}
+	return r.Items, nil
 }
 
 func (p *Provider) fetchItems(albumID string) ([]item, error) {
