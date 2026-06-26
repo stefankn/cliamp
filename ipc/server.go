@@ -3,6 +3,7 @@ package ipc
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -10,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"cliamp/applog"
@@ -31,6 +31,39 @@ type Server struct {
 	plugins  PluginDispatcher
 	done     chan struct{}
 	wg       sync.WaitGroup
+
+	connMu sync.Mutex
+	conns  map[net.Conn]struct{} // live connections, closed on shutdown
+}
+
+// addConn registers a live connection. It returns false if the server is
+// already shutting down, in which case the caller must close the connection
+// and return. The done check shares connMu with closeConns so a connection
+// accepted during shutdown is always closed by exactly one of them.
+func (s *Server) addConn(c net.Conn) bool {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	select {
+	case <-s.done:
+		return false
+	default:
+	}
+	s.conns[c] = struct{}{}
+	return true
+}
+
+func (s *Server) removeConn(c net.Conn) {
+	s.connMu.Lock()
+	delete(s.conns, c)
+	s.connMu.Unlock()
+}
+
+func (s *Server) closeConns() {
+	s.connMu.Lock()
+	for c := range s.conns {
+		c.Close()
+	}
+	s.connMu.Unlock()
 }
 
 // SetPluginDispatcher wires in the Lua plugin manager after the server starts.
@@ -51,7 +84,7 @@ func NewServer(sockPath string, disp Dispatcher) (*Server, error) {
 		return nil, fmt.Errorf("ipc: mkdir: %w", err)
 	}
 
-	ln, err := net.Listen("unix", sockPath)
+	ln, err := listenSocket(sockPath)
 	if err != nil {
 		return nil, fmt.Errorf("ipc: listen: %w", err)
 	}
@@ -76,6 +109,7 @@ func NewServer(sockPath string, disp Dispatcher) (*Server, error) {
 		sockPath: sockPath,
 		disp:     disp,
 		done:     make(chan struct{}),
+		conns:    make(map[net.Conn]struct{}),
 	}
 
 	s.wg.Add(1)
@@ -87,6 +121,9 @@ func NewServer(sockPath string, disp Dispatcher) (*Server, error) {
 func (s *Server) Close() error {
 	close(s.done)
 	err := s.listener.Close()
+	// Close in-flight connections so their handleConn read loops unblock
+	// immediately rather than waiting out the per-request read deadline.
+	s.closeConns()
 	s.wg.Wait()
 	os.Remove(s.sockPath)
 	os.Remove(s.sockPath + ".pid")
@@ -103,9 +140,16 @@ func (s *Server) acceptLoop() {
 			case <-s.done:
 				return
 			default:
-				time.Sleep(100 * time.Millisecond)
-				continue
 			}
+			// A closed listener is permanent — stop instead of spinning.
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			// Other errors may be transient (e.g. EMFILE); log and back off
+			// rather than silently retrying.
+			applog.Warn("ipc: accept: %v", err)
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
 		s.wg.Add(1)
 		go s.handleConn(conn)
@@ -117,6 +161,11 @@ func (s *Server) acceptLoop() {
 func (s *Server) handleConn(conn net.Conn) {
 	defer s.wg.Done()
 	defer conn.Close()
+
+	if !s.addConn(conn) {
+		return // server shutting down
+	}
+	defer s.removeConn(conn)
 
 	scanner := bufio.NewScanner(conn)
 
@@ -186,14 +235,7 @@ func (s *Server) dispatch(req Request) Response {
 		}
 		reply := make(chan Response, 1)
 		s.disp.Send(LoadMsg{Playlist: req.Playlist, Reply: reply})
-		select {
-		case resp := <-reply:
-			return resp
-		case <-time.After(3 * time.Second):
-			return Response{OK: false, Error: "load timeout"}
-		case <-s.done:
-			return Response{OK: false, Error: "server shutting down"}
-		}
+		return waitReply(reply, s.done, "load", 3*time.Second)
 
 	case "queue":
 		if req.Path == "" {
@@ -208,14 +250,7 @@ func (s *Server) dispatch(req Request) Response {
 		}
 		reply := make(chan Response, 1)
 		s.disp.Send(ThemeMsg{Name: req.Name, Reply: reply})
-		select {
-		case resp := <-reply:
-			return resp
-		case <-time.After(3 * time.Second):
-			return Response{OK: false, Error: "theme timeout"}
-		case <-s.done:
-			return Response{OK: false, Error: "server shutting down"}
-		}
+		return waitReply(reply, s.done, "theme", 3*time.Second)
 
 	case "vis":
 		if req.Name == "" {
@@ -223,29 +258,22 @@ func (s *Server) dispatch(req Request) Response {
 		}
 		reply := make(chan Response, 1)
 		s.disp.Send(VisMsg{Name: req.Name, Reply: reply})
-		select {
-		case resp := <-reply:
-			return resp
-		case <-time.After(3 * time.Second):
-			return Response{OK: false, Error: "vis timeout"}
-		case <-s.done:
-			return Response{OK: false, Error: "server shutting down"}
-		}
+		return waitReply(reply, s.done, "vis", 3*time.Second)
 
 	case "shuffle":
 		reply := make(chan Response, 1)
 		s.disp.Send(ShuffleMsg{Name: req.Name, Reply: reply})
-		return waitReply(reply, s.done)
+		return waitReply(reply, s.done, "shuffle", 3*time.Second)
 
 	case "repeat":
 		reply := make(chan Response, 1)
 		s.disp.Send(RepeatMsg{Name: req.Name, Reply: reply})
-		return waitReply(reply, s.done)
+		return waitReply(reply, s.done, "repeat", 3*time.Second)
 
 	case "mono":
 		reply := make(chan Response, 1)
 		s.disp.Send(MonoMsg{Name: req.Name, Reply: reply})
-		return waitReply(reply, s.done)
+		return waitReply(reply, s.done, "mono", 3*time.Second)
 
 	case "speed":
 		if req.Value <= 0 {
@@ -253,12 +281,12 @@ func (s *Server) dispatch(req Request) Response {
 		}
 		reply := make(chan Response, 1)
 		s.disp.Send(SpeedMsg{Speed: req.Value, Reply: reply})
-		return waitReply(reply, s.done)
+		return waitReply(reply, s.done, "speed", 3*time.Second)
 
 	case "eq":
 		reply := make(chan Response, 1)
 		s.disp.Send(EQMsg{Name: req.Name, Band: req.Band, Value: req.Value, Reply: reply})
-		return waitReply(reply, s.done)
+		return waitReply(reply, s.done, "eq", 3*time.Second)
 
 	case "device":
 		if req.Name == "" {
@@ -266,7 +294,7 @@ func (s *Server) dispatch(req Request) Response {
 		}
 		reply := make(chan Response, 1)
 		s.disp.Send(DeviceMsg{Name: req.Name, Reply: reply})
-		return waitReply(reply, s.done)
+		return waitReply(reply, s.done, "device", 3*time.Second)
 
 	case "status":
 		return s.handleStatus()
@@ -274,14 +302,7 @@ func (s *Server) dispatch(req Request) Response {
 	case "bands":
 		reply := make(chan Response, 1)
 		s.disp.Send(BandsRequestMsg{Reply: reply})
-		select {
-		case resp := <-reply:
-			return resp
-		case <-time.After(1 * time.Second):
-			return Response{OK: false, Error: "bands timeout"}
-		case <-s.done:
-			return Response{OK: false, Error: "server shutting down"}
-		}
+		return waitReply(reply, s.done, "bands", 1*time.Second)
 
 	case "plugin.call":
 		if s.plugins == nil {
@@ -307,13 +328,15 @@ func (s *Server) dispatch(req Request) Response {
 	}
 }
 
-// waitReply waits up to 3 seconds for a response on the reply channel.
-func waitReply(reply chan Response, done chan struct{}) Response {
+// waitReply waits up to timeout for a response on the reply channel, returning
+// a "<label> timeout" error if it elapses or a shutdown error if the server
+// closes first.
+func waitReply(reply chan Response, done chan struct{}, label string, timeout time.Duration) Response {
 	select {
 	case resp := <-reply:
 		return resp
-	case <-time.After(3 * time.Second):
-		return Response{OK: false, Error: "timeout"}
+	case <-time.After(timeout):
+		return Response{OK: false, Error: label + " timeout"}
 	case <-done:
 		return Response{OK: false, Error: "server shutting down"}
 	}
@@ -324,15 +347,7 @@ func waitReply(reply chan Response, done chan struct{}) Response {
 func (s *Server) handleStatus() Response {
 	reply := make(chan Response, 1)
 	s.disp.Send(StatusRequestMsg{Reply: reply})
-
-	select {
-	case resp := <-reply:
-		return resp
-	case <-time.After(3 * time.Second):
-		return Response{OK: false, Error: "status timeout"}
-	case <-s.done:
-		return Response{OK: false, Error: "server shutting down"}
-	}
+	return waitReply(reply, s.done, "status", 3*time.Second)
 }
 
 // writeResponse marshals a Response as JSON and writes it followed by a newline.
@@ -366,16 +381,11 @@ func cleanStaleSocket(sockPath string) error {
 		return nil
 	}
 
-	proc, err := os.FindProcess(pid)
+	alive, err := processAlive(pid)
 	if err != nil {
-		// Can't find process — clean up.
-		os.Remove(pidPath)
-		os.Remove(sockPath)
-		return nil
+		return fmt.Errorf("checking process liveness for socket %s: %w", sockPath, err)
 	}
-
-	// Signal 0 checks if the process exists without actually sending a signal.
-	if err := proc.Signal(syscall.Signal(0)); err != nil {
+	if !alive {
 		// Process is dead — clean up stale files.
 		os.Remove(pidPath)
 		os.Remove(sockPath)

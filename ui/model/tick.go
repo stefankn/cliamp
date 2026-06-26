@@ -1,6 +1,7 @@
 package model
 
 import (
+	"math"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
@@ -55,6 +56,12 @@ func (m *Model) visualizerTickContext(now time.Time) ui.VisTickContext {
 			buf := m.vis.EnsureSampleBuf(spec.FFTSize)
 			if !sampled || spec.FFTSize > sampledSize {
 				samplesRead = m.player.SamplesInto(buf)
+				if m.visVolumeLinked {
+					gain := math.Pow(10, m.player.Volume()/20)
+					for i := range samplesRead {
+						buf[i] *= gain
+					}
+				}
 				sampled = true
 				sampledSize = spec.FFTSize
 			}
@@ -103,6 +110,12 @@ func (m *Model) tickInterval() time.Duration {
 	if m.termTitle.introActive {
 		return ui.TickFast
 	}
+	// Fully idle: stopped or paused with nothing self-animating. Drop to the
+	// idle cadence so the CPU can sit in a low P-state between user actions.
+	// Bubbletea still wakes immediately on key / IPC / MPRIS / plugin events.
+	if m.isFullyIdle() {
+		return ui.TickIdle
+	}
 	d := ui.TickSlow
 	if m.vis != nil {
 		d = m.vis.TickInterval(m.visualizerTickContext(time.Time{}))
@@ -113,13 +126,38 @@ func (m *Model) tickInterval() time.Duration {
 	// cadence to save CPU.
 	if !m.isOverlayActive() && !m.buffering && m.player != nil &&
 		m.player.IsPlaying() && !m.player.IsPaused() && d > ui.TickFast {
+		if m.lowPower {
+			return ui.TickLowPowerPlaying
+		}
 		d = ui.TickFast
 	}
 	return d
 }
 
+// isFullyIdle reports whether the model has nothing changing on its own.
+// When true, the tick can run at ui.TickIdle since any state change will
+// arrive as an explicit message (key press, IPC, MPRIS, plugin send).
+func (m *Model) isFullyIdle() bool {
+	if m.player == nil {
+		return false
+	}
+	if m.player.IsPlaying() && !m.player.IsPaused() {
+		return false
+	}
+	if m.isOverlayActive() || m.buffering || m.termTitle.introActive {
+		return false
+	}
+	if !m.status.expiresAt.IsZero() || len(m.logLines) > 0 {
+		return false
+	}
+	if !m.reconnect.at.IsZero() {
+		return false
+	}
+	return true
+}
+
 func (m *Model) tickVisualizer(now time.Time) {
-	if m.vis == nil {
+	if m.vis == nil || m.vis.Mode == ui.VisNone {
 		return
 	}
 	m.vis.Tick(m.visualizerTickContext(now))

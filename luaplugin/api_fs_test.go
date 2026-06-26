@@ -1,12 +1,28 @@
 package luaplugin
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	lua "github.com/yuin/gopher-lua"
 )
+
+func fsAllowedPath(name string) string {
+	return filepath.Join(os.TempDir(), name)
+}
+
+func fsDisallowedPath() string {
+	if runtime.GOOS == "windows" {
+		if root := os.Getenv("WINDIR"); root != "" {
+			return filepath.Join(root, "System32", "drivers", "etc", "hosts")
+		}
+		return `C:\Windows\System32\drivers\etc\hosts`
+	}
+	return "/etc/passwd"
+}
 
 func TestFSWriteAndRead(t *testing.T) {
 	L := lua.NewState()
@@ -15,7 +31,7 @@ func TestFSWriteAndRead(t *testing.T) {
 	registerFSAPI(L, cliamp)
 	L.SetGlobal("cliamp", cliamp)
 
-	tmp := filepath.Join("/tmp", "cliamp-test-"+t.Name())
+	tmp := fsAllowedPath("cliamp-test-" + t.Name())
 	defer os.Remove(tmp)
 
 	L.SetGlobal("path", lua.LString(tmp))
@@ -44,7 +60,7 @@ func TestFSAppend(t *testing.T) {
 	registerFSAPI(L, cliamp)
 	L.SetGlobal("cliamp", cliamp)
 
-	tmp := filepath.Join("/tmp", "cliamp-test-append-"+t.Name())
+	tmp := fsAllowedPath("cliamp-test-append-" + t.Name())
 	defer os.Remove(tmp)
 
 	L.SetGlobal("path", lua.LString(tmp))
@@ -69,12 +85,12 @@ func TestFSExists(t *testing.T) {
 	registerFSAPI(L, cliamp)
 	L.SetGlobal("cliamp", cliamp)
 
-	tmp := filepath.Join("/tmp", "cliamp-test-exists-"+t.Name())
+	tmp := fsAllowedPath("cliamp-test-exists-" + t.Name())
 	os.WriteFile(tmp, []byte("x"), 0o644)
 	defer os.Remove(tmp)
 
 	L.SetGlobal("path", lua.LString(tmp))
-	L.SetGlobal("fake", lua.LString("/tmp/cliamp-definitely-not-here"))
+	L.SetGlobal("fake", lua.LString(fsAllowedPath("cliamp-definitely-not-here")))
 	err := L.DoString(`
 		_G.exists = cliamp.fs.exists(path)
 		_G.not_exists = cliamp.fs.exists(fake)
@@ -98,7 +114,7 @@ func TestFSRemove(t *testing.T) {
 	registerFSAPI(L, cliamp)
 	L.SetGlobal("cliamp", cliamp)
 
-	tmp := filepath.Join("/tmp", "cliamp-test-remove-"+t.Name())
+	tmp := fsAllowedPath("cliamp-test-remove-" + t.Name())
 	os.WriteFile(tmp, []byte("x"), 0o644)
 
 	L.SetGlobal("path", lua.LString(tmp))
@@ -123,9 +139,8 @@ func TestIsWriteAllowed(t *testing.T) {
 		path string
 		want bool
 	}{
-		{"/tmp/test.txt", true},
-		{"/etc/passwd", false},
-		{"/home/user/.ssh/id_rsa", false},
+		{fsAllowedPath("test.txt"), true},
+		{fsDisallowedPath(), false},
 	}
 
 	for _, tt := range tests {
@@ -142,7 +157,7 @@ func TestFSMkdirAndListdir(t *testing.T) {
 	registerFSAPI(L, cliamp)
 	L.SetGlobal("cliamp", cliamp)
 
-	base := filepath.Join("/tmp", "cliamp-test-mkdir-"+t.Name())
+	base := fsAllowedPath("cliamp-test-mkdir-" + t.Name())
 	defer os.RemoveAll(base)
 
 	L.SetGlobal("base", lua.LString(base))
@@ -176,17 +191,15 @@ func TestFSMkdirRejectsOutsideAllowlist(t *testing.T) {
 	registerFSAPI(L, cliamp)
 	L.SetGlobal("cliamp", cliamp)
 
-	err := L.DoString(`cliamp.fs.mkdir("/etc/cliamp-evil")`)
+	err := L.DoString(fmt.Sprintf("cliamp.fs.mkdir(%q)", fsDisallowedPath()))
 	if err == nil {
 		t.Fatal("expected error for path outside allowlist")
 	}
 }
 
 func TestMusicDirIsAllowed(t *testing.T) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		t.Skip("no home dir")
-	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
 	path := filepath.Join(home, "Music", "cliamp", "album", "01.mp3")
 	if !isWriteAllowed(path) {
 		t.Errorf("~/Music/cliamp/... should be writable")

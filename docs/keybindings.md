@@ -29,7 +29,7 @@ Press `?` or `Ctrl+K` in the player to see all keybindings.
 | `Shift+Up` `Shift+Down` | Move track up/down in playlist/queue |
 | `h` `l` | EQ cursor left/right |
 | `Enter` | Play selected track |
-| `/` | Search playlist |
+| `/` | Search playlist (navigate results with `↑` `↓` / `Ctrl+N` `Ctrl+P`; page scroll with `Ctrl+U` `Ctrl+D`) |
 | `Ctrl+X` | Expand/collapse playlist |
 | `o` | Open file browser |
 | `b` `Esc` | Back to provider |
@@ -42,6 +42,7 @@ Press `?` or `Ctrl+K` in the player to see all keybindings.
 | `e` | Cycle EQ preset |
 | `t` | Choose theme |
 | `v` | Cycle visualizer |
+| `Ctrl+V` | Pick visualizer from a list (live preview) |
 | `V` | Full screen visualizer |
 | `Ctrl+H` | Toggle album headers |
 
@@ -85,6 +86,7 @@ Press `?` or `Ctrl+K` in the player to see all keybindings.
 | `Enter` / `→` | List screen: open the highlighted playlist · Tracks screen: play the **highlighted** track |
 | `P` | Tracks screen: play all from the top |
 | `a` | Add the now-playing track (footer shows which track) |
+| `r` | List: rename the playlist |
 | `d` | List: delete playlist (confirms) · Tracks: remove the highlighted track |
 | `←` `Backspace` `h` | Tracks screen: go back to the list |
 | `p` `Esc` | Close the playlist manager |
@@ -115,6 +117,7 @@ The playlists pane (visible when focus is on a provider — Spotify, Navidrome, 
 | Key | Action |
 |---|---|
 | `↑` `↓` / `j` `k` | Move cursor (wraps) |
+| `Ctrl+U` `Ctrl+D` | Scroll by page |
 | `Enter` | Load the highlighted playlist's tracks into the queue |
 | `/` | Filter the playlist list |
 | `Ctrl+F` | Online/server search (Spotify/Navidrome/NetEase/etc.'s own search) |
@@ -131,12 +134,25 @@ When `Ctrl+F` opens provider search or YouTube/SoundCloud net search and you're 
 
 | Key | Action |
 |---|---|
-| `↑` `↓` / `j` `k` | Move cursor |
+| `↑` `↓` / `j` `k` / `Ctrl+N` `Ctrl+P` | Move cursor (single item) |
+| `Ctrl+U` `Ctrl+D` | Scroll results by page |
 | `Enter` | Play the selected track now |
 | `a` | Append the selected track to the playlist |
 | `q` | Queue the selected track to play next |
 | `p` | (Spotify only) Save the selected track to a Spotify playlist |
 | `Esc` `Backspace` | Back to the search input |
+
+## Fuzzy search
+
+The local search boxes match fuzzily: your query characters only need to appear in order, not contiguously, and results are ranked by relevance (best match first). For example, `skr` or `saku` both find a track titled "Sakura".
+
+This applies to:
+
+- `/` playlist search
+- `/` file browser filter
+- `Ctrl+F` when the active provider is Local (your saved playlists)
+
+Other `Ctrl+F` providers (Spotify, Navidrome, Jellyfin, Emby, Plex, NetEase, YouTube) send your query to their own search API, so matching there follows each service's rules.
 
 ## General
 

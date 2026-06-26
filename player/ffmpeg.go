@@ -2,7 +2,9 @@ package player
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -10,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gopxl/beep/v2"
 )
@@ -19,6 +22,9 @@ const pcmFrameSize16 = 4
 
 // pcmFrameSize32 is the byte size of one stereo f32le sample frame (2 channels × 4 bytes).
 const pcmFrameSize32 = 8
+
+// ffmpegPipeTimeout limits how long URL streams may take to produce initial PCM.
+const ffmpegPipeTimeout = 15 * time.Second
 
 // pcmFrameSize returns the byte size of one stereo sample frame for the given format.
 func pcmFrameSize(f32 bool) int {
@@ -83,6 +89,12 @@ func decodeFFmpeg(path string, sr beep.SampleRate, bitDepth int) (beep.StreamSee
 
 	out, err := cmd.Output()
 	if err != nil {
+		// cmd.Output captures stderr into ExitError.Stderr; surface it since
+		// ffmpeg writes the actual failure reason there (-loglevel error).
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && len(ee.Stderr) > 0 {
+			return nil, beep.Format{}, fmt.Errorf("ffmpeg decode: %w: %s", err, bytes.TrimSpace(ee.Stderr))
+		}
 		return nil, beep.Format{}, fmt.Errorf("ffmpeg decode: %w", err)
 	}
 
@@ -154,10 +166,22 @@ func decodeFFmpegStream(path string, sr beep.SampleRate, bitDepth int) (*ffmpegP
 		ext := filepath.Ext(path)
 		return nil, beep.Format{}, fmt.Errorf("ffmpeg is required to play %s files — install it with your package manager", ext)
 	}
+	fp, format, err := startFFmpegPipe(path, nil, sr, bitDepth)
+	if err != nil {
+		return nil, beep.Format{}, err
+	}
+	return &ffmpegPipeStreamer{ffmpegPipe: fp}, format, nil
+}
 
+// startFFmpegPipe launches ffmpeg transcoding input to raw PCM on stdout and
+// returns an ffmpegPipe reading that stdout. input is the ffmpeg -i argument
+// (a URL/path, or "pipe:0" when feeding via stdin); stdin, when non-nil, is
+// wired to the process. Callers add the concrete Seek behavior by embedding the
+// returned ffmpegPipe in a streamer type.
+func startFFmpegPipe(input string, stdin io.ReadCloser, sr beep.SampleRate, bitDepth int) (ffmpegPipe, beep.Format, error) {
 	pcmFmt, codec, precision := ffmpegPCMArgs(bitDepth)
 	cmd := exec.Command("ffmpeg",
-		"-i", path,
+		"-i", input,
 		"-f", pcmFmt,
 		"-acodec", codec,
 		"-ar", strconv.Itoa(int(sr)),
@@ -165,22 +189,19 @@ func decodeFFmpegStream(path string, sr beep.SampleRate, bitDepth int) (*ffmpegP
 		"-loglevel", "error",
 		"pipe:1",
 	)
+	cmd.Stdin = stdin
 
 	pipe, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, beep.Format{}, fmt.Errorf("ffmpeg stdout pipe: %w", err)
+		return ffmpegPipe{}, beep.Format{}, fmt.Errorf("ffmpeg stdout pipe: %w", err)
 	}
 	if err := cmd.Start(); err != nil {
-		return nil, beep.Format{}, fmt.Errorf("ffmpeg start: %w", err)
+		return ffmpegPipe{}, beep.Format{}, fmt.Errorf("ffmpeg start: %w", err)
 	}
 
-	format := beep.Format{
-		SampleRate:  sr,
-		NumChannels: 2,
-		Precision:   precision,
-	}
-
-	return &ffmpegPipeStreamer{ffmpegPipe: ffmpegPipe{cmd: cmd, reader: bufio.NewReaderSize(pipe, pipeBufSize), pipe: pipe, f32: bitDepth == 32}}, format, nil
+	fp := ffmpegPipe{cmd: cmd, reader: bufio.NewReaderSize(pipe, pipeBufSize), pipe: pipe, src: stdin, f32: bitDepth == 32}
+	format := beep.Format{SampleRate: sr, NumChannels: 2, Precision: precision}
+	return fp, format, nil
 }
 
 // ffmpegPipe holds the common state and methods shared by all pipe-based
@@ -190,6 +211,7 @@ type ffmpegPipe struct {
 	cmd    *exec.Cmd
 	reader *bufio.Reader
 	pipe   io.ReadCloser
+	src    io.ReadCloser        // optional stdin source (e.g. ICY-wrapped body); closed on stop
 	buf    [pcmFrameSize32]byte // large enough for both 16-bit and 32-bit frames
 	f32    bool                 // true = f32le, false = s16le
 	err    error
@@ -207,14 +229,28 @@ func (f *ffmpegPipe) Err() error    { return f.err }
 func (f *ffmpegPipe) Len() int      { return f.total }
 func (f *ffmpegPipe) Position() int { return f.pos }
 
-// stop kills the running ffmpeg process and cleans up.
+// stop kills the running ffmpeg process and cleans up. When stdin is fed from
+// src, src is closed first: os/exec runs a goroutine copying src -> ffmpeg
+// stdin, and cmd.Wait() blocks until it returns. For an infinite radio stream
+// that goroutine is parked in src.Read, so src must be closed to unblock it
+// before Wait, otherwise stop hangs.
 func (f *ffmpegPipe) stop() {
-	if f.pipe != nil {
-		f.pipe.Close()
+	src := f.src
+	pipe := f.pipe
+	cmd := f.cmd
+	f.src = nil
+	f.pipe = nil
+	f.cmd = nil
+
+	if src != nil {
+		src.Close()
 	}
-	if f.cmd != nil && f.cmd.Process != nil {
-		f.cmd.Process.Kill()
-		f.cmd.Wait()
+	if pipe != nil {
+		pipe.Close()
+	}
+	if cmd != nil && cmd.Process != nil {
+		cmd.Process.Kill()
+		cmd.Wait()
 	}
 }
 
@@ -230,6 +266,33 @@ func (f *ffmpegPipe) bitDepth() int {
 	return 16
 }
 
+// waitForInitialAudio waits until ffmpeg has produced at least one PCM byte.
+// This runs before a URL stream is handed to the speaker, so an idle or broken
+// live stream cannot park the audio goroutine in Read and block future swaps.
+func (f *ffmpegPipe) waitForInitialAudio(timeout time.Duration) error {
+	peekErr := make(chan error, 1)
+	go func() {
+		_, err := f.reader.Peek(1)
+		peekErr <- err
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case err := <-peekErr:
+		if err != nil {
+			f.stop()
+			return fmt.Errorf("waiting for audio data: %w", err)
+		}
+		return nil
+	case <-timer.C:
+		f.stop()
+		<-peekErr // drain after stop unblocks the pipe reader
+		return fmt.Errorf("timed out waiting for audio data (%v)", timeout)
+	}
+}
+
 // ffmpegPipeStreamer reads PCM data incrementally from a running ffmpeg process.
 // Used for live/infinite streams where seeking is not supported.
 type ffmpegPipeStreamer struct {
@@ -237,6 +300,23 @@ type ffmpegPipeStreamer struct {
 }
 
 func (f *ffmpegPipeStreamer) Seek(int) error { return nil }
+
+// decodeFFmpegPipeStream starts ffmpeg reading from src via stdin (pipe:0)
+// instead of letting ffmpeg open the URL itself. Keeping the caller's reader
+// chain in the data path means the ICY metadata reader stays attached, so live
+// radio StreamTitle parsing keeps working for ffmpeg-only codecs (AAC, AAC+,
+// Opus, ...). src is closed when the stream stops. Used for live/infinite HTTP
+// streams; seeking is not supported.
+func decodeFFmpegPipeStream(src io.ReadCloser, sr beep.SampleRate, bitDepth int) (*ffmpegPipeStreamer, beep.Format, error) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		return nil, beep.Format{}, fmt.Errorf("ffmpeg is required to play this stream — install it with your package manager")
+	}
+	fp, format, err := startFFmpegPipe("pipe:0", src, sr, bitDepth)
+	if err != nil {
+		return nil, beep.Format{}, err
+	}
+	return &ffmpegPipeStreamer{ffmpegPipe: fp}, format, nil
+}
 
 // decodeFFmpegLocal starts ffmpeg as a streaming pipe for local files, giving
 // instant playback start instead of buffering the entire file to memory.

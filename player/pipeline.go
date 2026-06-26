@@ -87,6 +87,17 @@ func (p *Player) buildPipeline(path string) (*trackPipeline, error) {
 	return p.buildPipelineAt(path, 0, 0)
 }
 
+func (p *Player) decodeFFmpegURLStream(path string) (*ffmpegPipeStreamer, beep.Format, error) {
+	decoder, format, err := decodeFFmpegStream(path, p.sr, p.bitDepth)
+	if err != nil {
+		return nil, beep.Format{}, err
+	}
+	if err := decoder.waitForInitialAudio(ffmpegPipeTimeout); err != nil {
+		return nil, beep.Format{}, err
+	}
+	return decoder, format, nil
+}
+
 // buildPipelineAt is like buildPipeline but starts the HTTP stream at byteOffset
 // (using a Range: bytes=N- header) and records timeOffset as the playback origin.
 // For local files byteOffset is ignored; use decoder.Seek instead.
@@ -158,6 +169,25 @@ func (p *Player) buildPipelineAt(path string, byteOffset int64, timeOffset time.
 		}, nil
 	}
 
+	ext := formatExt(path)
+
+	// HLS playlists must be opened by ffmpeg directly from the URL so it can
+	// resolve relative chunklist/segment URIs and follow the live segment
+	// window. Feeding the playlist bytes via stdin (the needsFFmpeg path below)
+	// would strip the base URL and break relative segment resolution.
+	if isURL(path) && isHLS(ext) {
+		decoder, format, err := p.decodeFFmpegURLStream(path)
+		if err != nil {
+			return nil, fmt.Errorf("open hls: %w", err)
+		}
+		return &trackPipeline{
+			decoder: decoder,
+			stream:  decoder,
+			format:  format,
+			path:    path,
+		}, nil
+	}
+
 	src, err := openSourceAt(path, byteOffset, onMeta)
 	if err != nil {
 		return nil, fmt.Errorf("open source: %w", err)
@@ -172,7 +202,6 @@ func (p *Player) buildPipelineAt(path string, byteOffset int64, timeOffset time.
 	}
 
 	// Determine format: prefer URL extension, fall back to Content-Type.
-	ext := formatExt(path)
 	if isURL(path) && ext == ".mp3" && src.contentType != "" {
 		if ctExt := extFromContentType(src.contentType); ctExt != "" {
 			ext = ctExt
@@ -181,10 +210,20 @@ func (p *Player) buildPipelineAt(path string, byteOffset int64, timeOffset time.
 
 	// For OGG HTTP streams, use the chained decoder so Icecast radio
 	// continues across song boundaries instead of stopping at EOS.
+	// If Vorbis init fails (e.g. OggFLAC or OggOpus), fall back to ffmpeg.
 	if isURL(path) && ext == ".ogg" {
 		tp, err := p.buildChainedOggPipeline(rc, onMeta)
 		if err != nil {
-			return nil, err
+			rc.Close()
+			decoder, fmt2, err2 := p.decodeFFmpegURLStream(path)
+			if err2 != nil {
+				return nil, fmt.Errorf("decode: %w", err2)
+			}
+			return &trackPipeline{
+				decoder: decoder,
+				stream:  decoder,
+				format:  fmt2,
+			}, nil
 		}
 		tp.bytesRead = byteCounter
 		tp.contentLength = src.contentLength
@@ -193,17 +232,26 @@ func (p *Player) buildPipelineAt(path string, byteOffset int64, timeOffset time.
 
 	// For HTTP streams that need ffmpeg (e.g. AAC+), use the streaming
 	// pipe decoder so playback starts immediately instead of buffering
-	// the entire (potentially infinite) stream.
+	// the entire (potentially infinite) stream. Feed ffmpeg from the existing
+	// reader chain via stdin rather than handing it the URL: this keeps the
+	// ICY metadata reader attached so live radio StreamTitle parsing works for
+	// ffmpeg-only codecs (AAC, AAC+, Opus, ...).
 	if isURL(path) && needsFFmpeg(ext) {
-		rc.Close()
-		decoder, format, err := decodeFFmpegStream(path, p.sr, p.bitDepth)
+		decoder, format, err := decodeFFmpegPipeStream(rc, p.sr, p.bitDepth)
 		if err != nil {
+			rc.Close()
+			return nil, fmt.Errorf("decode: %w", err)
+		}
+		if err := decoder.waitForInitialAudio(ffmpegPipeTimeout); err != nil {
 			return nil, fmt.Errorf("decode: %w", err)
 		}
 		return &trackPipeline{
-			decoder: decoder,
-			stream:  decoder,
-			format:  format,
+			decoder:       decoder,
+			stream:        decoder,
+			format:        format,
+			path:          path,
+			bytesRead:     byteCounter,
+			contentLength: src.contentLength,
 		}, nil
 	}
 
@@ -240,8 +288,20 @@ func (p *Player) buildPipelineAt(path string, byteOffset int64, timeOffset time.
 		if needsFFmpeg(ext) {
 			return nil, fmt.Errorf("decode: %w", err)
 		}
-		// Native decoder failed (e.g., IEEE float WAV). Fall back to ffmpeg,
-		// which reads from the path directly and handles more formats.
+		if isURL(path) {
+			decoder, format, err := p.decodeFFmpegURLStream(path)
+			if err != nil {
+				return nil, fmt.Errorf("decode: %w", err)
+			}
+			return &trackPipeline{
+				decoder: decoder,
+				stream:  decoder,
+				format:  format,
+				path:    path,
+			}, nil
+		}
+		// Native local decoder failed (e.g., IEEE float WAV). Fall back to
+		// buffered ffmpeg decode, which handles more formats.
 		decoder, format, err = decodeFFmpeg(path, p.sr, p.bitDepth)
 		if err != nil {
 			return nil, fmt.Errorf("decode: %w", err)

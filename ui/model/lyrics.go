@@ -10,7 +10,7 @@ import (
 // For streams with ICY metadata ("Artist - Song"), it parses the stream title.
 // For regular tracks, it uses the track's metadata fields.
 func (m *Model) lyricsArtistTitle() (artist, title string) {
-	track, idx := m.playlist.Current()
+	track, idx := m.currentPlaybackTrack()
 	if idx < 0 {
 		return "", ""
 	}
@@ -28,7 +28,7 @@ func (m *Model) lyricsArtistTitle() (artist, title string) {
 // accurate position tracking), but false for live radio (ICY — position is
 // from stream start, not song start) and yt-dlp pipe streams (position is 0).
 func (m *Model) lyricsSyncable() bool {
-	track, idx := m.playlist.Current()
+	track, idx := m.currentPlaybackTrack()
 	if idx < 0 {
 		return false
 	}
@@ -53,15 +53,4 @@ func (m *Model) lyricsHaveTimestamps() bool {
 		}
 	}
 	return false
-}
-
-// lyricsVisibleHeight returns the number of lyrics lines to show.
-func (m *Model) lyricsVisibleHeight() int {
-	return m.measureOverlayVisible([]string{
-		titleStyle.Render("L Y R I C S"),
-		"",
-		"x",
-		"",
-		helpKey("Esc", "Close"),
-	}, maxPlVisible)
 }

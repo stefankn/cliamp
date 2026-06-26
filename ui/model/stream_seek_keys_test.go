@@ -38,6 +38,8 @@ func (f *fakeEngine) GaplessAdvanced() bool                               { retu
 func (f *fakeEngine) Position() time.Duration                             { return f.position }
 func (f *fakeEngine) Duration() time.Duration                             { return time.Hour }
 func (f *fakeEngine) PositionAndDuration() (time.Duration, time.Duration) { return 0, time.Hour }
+func (f *fakeEngine) SetVolumeMin(float64)                                {}
+func (f *fakeEngine) VolumeMin() float64                                  { return -50 }
 func (f *fakeEngine) SetVolume(float64)                                   {}
 func (f *fakeEngine) Volume() float64                                     { return 0 }
 func (f *fakeEngine) SetSpeed(float64)                                    {}

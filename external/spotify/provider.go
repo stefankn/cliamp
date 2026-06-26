@@ -37,42 +37,6 @@ var (
 )
 
 // maxResponseBody limits JSON API responses to 10 MB.
-const maxResponseBody = 10 << 20
-
-// Pagination limits for the Spotify Web API.
-const (
-	spotifyPlaylistPageSize = 50
-	// spotifyTrackPageSize is capped at 50 because /v1/playlists/{id}/items
-	// silently truncates larger limits; requesting more would cause the loop
-	// to skip items when offset advances by the requested limit.
-	spotifyTrackPageSize = 50
-)
-
-// spotifyPlaylistItem is the raw playlist object returned by /v1/me/playlists.
-type spotifyPlaylistItem struct {
-	ID            string `json:"id"`
-	Name          string `json:"name"`
-	SnapshotID    string `json:"snapshot_id"`
-	Collaborative bool   `json:"collaborative"`
-	Owner         struct {
-		ID string `json:"id"`
-	} `json:"owner"`
-	Items *struct {
-		Total int `json:"total"`
-	} `json:"items"`
-}
-
-// playlistAccessible reports whether the playlist should be shown to the user.
-// Playlists saved from other users (not owned, not collaborative) are excluded
-// because the Spotify API returns 403 when listing their tracks.
-// When userID is empty (fetch failed), all playlists are included as a fallback.
-func playlistAccessible(item spotifyPlaylistItem, userID string) bool {
-	if userID == "" {
-		return true
-	}
-	return item.Owner.ID == userID || item.Collaborative
-}
-
 // SpotifyProvider implements playlist.Provider using the Spotify Web API
 // for playlist/track metadata and go-librespot for audio streaming.
 // playlistCache holds a snapshot_id and the fetched tracks for a playlist,
@@ -240,7 +204,7 @@ func (p *SpotifyProvider) Playlists() ([]playlist.PlaylistInfo, error) {
 
 	p.mu.Lock()
 	if p.listCache != nil && time.Since(p.listCacheAt) < playlistListCacheTTL {
-		cached := p.listCache
+		cached := slices.Clone(p.listCache)
 		p.mu.Unlock()
 		return cached, nil
 	}
@@ -273,14 +237,12 @@ func (p *SpotifyProvider) Playlists() ([]playlist.PlaylistInfo, error) {
 	// i.e. 'Liked Songs' or 'Lieblingssongs' etc.
 	// For the moment, "Your Music" must sufficice without adding a localization
 	// map.
-	p.mu.Lock()
 	all = append(all, playlist.PlaylistInfo{
 		ID:         "YOUR MUSIC",
 		Name:       "Your Music",
 		TrackCount: result.Total,
 		Section:    "Library",
 	})
-	p.mu.Unlock()
 
 	for {
 		query := url.Values{
@@ -357,11 +319,11 @@ func (p *SpotifyProvider) Playlists() ([]playlist.PlaylistInfo, error) {
 	p.listCacheAt = time.Now()
 	p.mu.Unlock()
 
-	return all, nil
+	return slices.Clone(all), nil
 }
 
 // Tracks returns all tracks for the given Spotify playlist ID.
-// Track.Path is set to a spotify:track:<id> URI for the player to resolve.
+// Track.Path is set to the canonical spotify: URI for the player to resolve.
 // Results are cached by snapshot_id; unchanged playlists skip the API call.
 func (p *SpotifyProvider) Tracks(playlistID string) ([]playlist.Track, error) {
 	if err := p.ensureSession(); err != nil {
@@ -370,7 +332,7 @@ func (p *SpotifyProvider) Tracks(playlistID string) ([]playlist.Track, error) {
 	// Check cache — if we have tracks and the snapshot_id hasn't changed, return cached.
 	p.mu.Lock()
 	if cached, ok := p.trackCache[playlistID]; ok && cached.tracks != nil {
-		tracks := cached.tracks
+		tracks := slices.Clone(cached.tracks)
 		p.mu.Unlock()
 		return tracks, nil
 	}
@@ -378,24 +340,6 @@ func (p *SpotifyProvider) Tracks(playlistID string) ([]playlist.Track, error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-
-	type trackObj struct {
-		ID      string `json:"id"`
-		Name    string `json:"name"`
-		Artists []struct {
-			Name string `json:"name"`
-		} `json:"artists"`
-		Album struct {
-			Name        string `json:"name"`
-			ReleaseDate string `json:"release_date"`
-		} `json:"album"`
-		DurationMs   int   `json:"duration_ms"`
-		TrackNumber  int   `json:"track_number"`
-		IsPlayable   *bool `json:"is_playable"`
-		Restrictions struct {
-			Reason string `json:"reason"`
-		} `json:"restrictions"`
-	}
 
 	var all []playlist.Track
 	offset := 0
@@ -417,7 +361,7 @@ func (p *SpotifyProvider) Tracks(playlistID string) ([]playlist.Track, error) {
 			query := url.Values{
 				"limit":  {fmt.Sprintf("%d", limit)},
 				"offset": {fmt.Sprintf("%d", offset)},
-				"fields": {"items(item(id,name,artists(name),album(name,release_date),duration_ms,track_number,is_playable,restrictions(reason))),total"},
+				"fields": {"items(item(id,name,type,uri,artists(name),album(name,release_date),show(name),release_date,duration_ms,track_number,is_playable,restrictions(reason))),total"},
 			}
 			path := fmt.Sprintf("/v1/playlists/%s/items", playlistID)
 			resp, err = p.webAPI(ctx, "GET", path, query)
@@ -432,8 +376,8 @@ func (p *SpotifyProvider) Tracks(playlistID string) ([]playlist.Track, error) {
 
 		var result struct {
 			Items []struct {
-				Item  *trackObj `json:"item"`
-				Track *trackObj `json:"track"`
+				Item  *spotifyItem `json:"item"`
+				Track *spotifyItem `json:"track"`
 			} `json:"items"`
 			Total int `json:"total"`
 		}
@@ -449,30 +393,7 @@ func (p *SpotifyProvider) Tracks(playlistID string) ([]playlist.Track, error) {
 			if t == nil || t.ID == "" {
 				continue // skip local/unavailable tracks
 			}
-
-			artists := make([]string, len(t.Artists))
-			for i, a := range t.Artists {
-				artists[i] = a.Name
-			}
-
-			var year int
-			if len(t.Album.ReleaseDate) >= 4 {
-				if y, err := strconv.Atoi(t.Album.ReleaseDate[:4]); err == nil {
-					year = y
-				}
-			}
-
-			all = append(all, playlist.Track{
-				Path:         fmt.Sprintf("spotify:track:%s", t.ID),
-				Title:        t.Name,
-				Artist:       strings.Join(artists, ", "),
-				Album:        t.Album.Name,
-				Year:         year,
-				Stream:       false, // must be false: true causes togglePlayPause to stop+restart instead of pause/resume
-				DurationSecs: t.DurationMs / 1000,
-				TrackNumber:  t.TrackNumber,
-				Unplayable:   (t.IsPlayable != nil && !*t.IsPlayable) || t.Restrictions.Reason != "",
-			})
+			all = append(all, trackFromItem(t))
 		}
 
 		if offset+limit >= result.Total {
@@ -490,7 +411,7 @@ func (p *SpotifyProvider) Tracks(playlistID string) ([]playlist.Track, error) {
 	}
 	p.mu.Unlock()
 
-	return all, nil
+	return slices.Clone(all), nil
 }
 
 // isAuthError returns true if the error is an authentication/session-related
@@ -518,7 +439,8 @@ func isAuthError(err error) bool {
 // Implements provider.CustomStreamer.
 func (p *SpotifyProvider) URISchemes() []string { return []string{"spotify:"} }
 
-// NewStreamer creates a SpotifyStreamer for the given spotify:track:xxx URI.
+// NewStreamer creates a SpotifyStreamer for the given spotify: URI (track or
+// episode).
 // If the stream fails due to an auth error (e.g. expired session, AES key
 // rejection), the player tries a silent reconnect from cached credentials.
 // If that fails — or the retry still hits an auth error — the streamer
@@ -614,6 +536,11 @@ func (p *SpotifyProvider) webAPIWithBody(ctx context.Context, method, path strin
 		}
 		if resp.StatusCode == http.StatusTooManyRequests {
 			resp.Body.Close()
+			// On the last attempt there's no retry after the wait, so don't
+			// sleep (up to 128s) just to give up; fail now.
+			if attempt == maxRetries-1 {
+				break
+			}
 			wait := time.Duration(1<<uint(attempt)) * time.Second
 			if ra := resp.Header.Get("Retry-After"); ra != "" {
 				if secs, err := strconv.Atoi(ra); err == nil && secs > 0 {
@@ -659,7 +586,9 @@ func friendlySearchError(err error) error {
 	return fmt.Errorf("spotify: search: %w", err)
 }
 
-// SearchTracks searches for tracks on Spotify and returns up to limit results.
+// SearchTracks searches Spotify for tracks and podcast episodes, returning up
+// to limit results of each. Episodes (e.g. podcasts) are routed through their
+// spotify:episode: URI so they play correctly.
 // limit is clamped to Spotify's accepted range of 1..50.
 func (p *SpotifyProvider) SearchTracks(ctx context.Context, query string, limit int) ([]playlist.Track, error) {
 	if err := p.ensureSession(); err != nil {
@@ -676,7 +605,7 @@ func (p *SpotifyProvider) SearchTracks(ctx context.Context, query string, limit 
 	// implicitly scopes results to the account's country.
 	q := url.Values{
 		"q":     {query},
-		"type":  {"track"},
+		"type":  {"track,episode"},
 		"limit": {fmt.Sprintf("%d", limit)},
 	}
 
@@ -687,53 +616,31 @@ func (p *SpotifyProvider) SearchTracks(ctx context.Context, query string, limit 
 
 	var result struct {
 		Tracks struct {
-			Items []struct {
-				ID      string `json:"id"`
-				Name    string `json:"name"`
-				Artists []struct {
-					Name string `json:"name"`
-				} `json:"artists"`
-				Album struct {
-					Name        string `json:"name"`
-					ReleaseDate string `json:"release_date"`
-				} `json:"album"`
-				DurationMs int `json:"duration_ms"`
-			} `json:"items"`
+			Items []*spotifyItem `json:"items"`
 		} `json:"tracks"`
+		Episodes struct {
+			Items []*spotifyItem `json:"items"`
+		} `json:"episodes"`
 	}
 	if err := decodeBody(resp, &result); err != nil {
 		return nil, fmt.Errorf("spotify: parse search: %w", err)
 	}
 
 	var tracks []playlist.Track
-	for _, t := range result.Tracks.Items {
-		if t.ID == "" {
-			continue
-		}
-		artists := make([]string, len(t.Artists))
-		for i, a := range t.Artists {
-			artists[i] = a.Name
-		}
-		var year int
-		if len(t.Album.ReleaseDate) >= 4 {
-			if y, err := strconv.Atoi(t.Album.ReleaseDate[:4]); err == nil {
-				year = y
+	for _, items := range [][]*spotifyItem{result.Tracks.Items, result.Episodes.Items} {
+		for _, t := range items {
+			if t == nil || t.ID == "" {
+				continue // skip null/unavailable results
 			}
+			tracks = append(tracks, trackFromItem(t))
 		}
-		tracks = append(tracks, playlist.Track{
-			Path:         fmt.Sprintf("spotify:track:%s", t.ID),
-			Title:        t.Name,
-			Artist:       strings.Join(artists, ", "),
-			Album:        t.Album.Name,
-			Year:         year,
-			DurationSecs: t.DurationMs / 1000,
-		})
 	}
 	return tracks, nil
 }
 
 // AddTrackToPlaylist adds a track to an existing Spotify playlist.
-// The track's Path is used as the Spotify URI (e.g. "spotify:track:xxx").
+// The track's Path is used as the Spotify URI (e.g. "spotify:track:..." or
+// "spotify:episode:..."); the Spotify API accepts either.
 // Implements provider.PlaylistWriter.
 func (p *SpotifyProvider) AddTrackToPlaylist(ctx context.Context, playlistID string, track playlist.Track) error {
 	trackURI := track.Path

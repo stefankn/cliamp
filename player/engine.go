@@ -36,6 +36,8 @@ type Engine interface {
 	PositionAndDuration() (time.Duration, time.Duration)
 
 	// Volume
+	SetVolumeMin(db float64)
+	VolumeMin() float64
 	SetVolume(db float64)
 	Volume() float64
 

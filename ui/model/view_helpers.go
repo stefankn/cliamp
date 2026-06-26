@@ -7,36 +7,12 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
+
 	"cliamp/playlist"
 	"cliamp/ui"
 )
-
-// formatListRangeCount returns a human-readable viewport counter.
-// It emits "start-end of total" when partially visible, and collapses to
-// "total" when the full list is visible.
-func (m Model) formatListRangeCount(startIndex, visibleCount, total int) string {
-	if total <= 0 || visibleCount <= 0 {
-		return "0"
-	}
-	if startIndex >= total {
-		startIndex = max(0, total-1)
-	}
-	start := startIndex + 1
-	if start < 1 {
-		start = 1
-	}
-	end := startIndex + visibleCount
-	if end > total {
-		end = total
-	}
-	if end < start {
-		end = start
-	}
-	if start == 1 && end == total {
-		return fmt.Sprintf("%d", total)
-	}
-	return fmt.Sprintf("%d-%d of %d", start, end, total)
-}
 
 // formatListMatchCount returns a human-readable "matches of total" summary
 // for filtered lists.
@@ -118,19 +94,6 @@ func formatTrackRow(num int, name string, secs int) string {
 	return numStr + title + strings.Repeat(" ", pad) + dur
 }
 
-// tracksSubtitle renders a "N tracks · Hh Mm" headline shown under track-list
-// titles. Returns "" when the slice is empty so callers can suppress the line.
-func tracksSubtitle(tracks []playlist.Track) string {
-	if len(tracks) == 0 {
-		return ""
-	}
-	out := fmt.Sprintf("%d tracks", len(tracks))
-	if d := formatPlaylistDuration(playlist.TotalDurationSecs(tracks)); d != "" {
-		out += " · " + d
-	}
-	return out
-}
-
 // truncate shortens s to maxW runes, appending "…" if truncated.
 // Uses RuneCountInString first to avoid rune slice allocation in the common
 // case where the string is already short enough.
@@ -154,15 +117,6 @@ func cursorLine(label string, active bool) string {
 		return playlistSelectedStyle.Render("> " + label)
 	}
 	return dimStyle.Render("  " + label)
-}
-
-// scrollStart returns the scroll offset so that cursor remains visible
-// within a window of maxVisible items.
-func scrollStart(cursor, maxVisible int) int {
-	if cursor >= maxVisible {
-		return cursor - maxVisible + 1
-	}
-	return 0
 }
 
 // spinnerFrames is the braille-dot animation used to indicate loading. The
@@ -203,38 +157,57 @@ func helpKey(key, label string) string {
 	return helpKeyStyle.Render(" "+key+" ") + helpStyle.Render(" "+label)
 }
 
+// fitHelpLine keeps a help line to a single panel-wide row. Overlay help lines
+// are fixed strings that can exceed the panel width and wrap to two rows, which
+// would shift the layout height; this clips them (ANSI-aware) to one row.
+func fitHelpLine(s string) string {
+	if ui.PanelWidth <= 0 || lipgloss.Width(s) <= ui.PanelWidth {
+		return s
+	}
+	return ansi.Truncate(s, ui.PanelWidth, "")
+}
+
+// toggleAlbumHeadersManual flips header visibility and pins the choice so
+// later Adds don't re-run the cohesion heuristic over the user.
+func (m *Model) toggleAlbumHeadersManual() {
+	m.showAlbumHeaders = !m.showAlbumHeaders
+	m.headerManual = true
+}
+
 // minTracksPerAlbum is the threshold at which a list is considered cohesive
 // enough to default to showing album headers; below this average tracks/album,
 // the list looks like a fragmented mixtape and headers add noise.
 const minTracksPerAlbum = 3.0
 
-// isListCohesive returns true if the track list appears to be organized into
-// distinct albums (e.g. an artist's discography or a full album) rather than
-// a fragmented mixtape.
-func isListCohesive(tracks []playlist.Track) bool {
-	headers := 0
-	prev := ""
-	first := true
-	for _, t := range tracks {
-		if first || t.Album != prev {
-			headers++
-			prev = t.Album
-			first = false
-		}
-	}
-
-	if headers == 0 {
-		return false
-	}
-	return float64(len(tracks))/float64(headers) >= minTracksPerAlbum
+// setHeaderStateFromTracks resets the running counters and re-runs the
+// cohesion heuristic. A fresh load also clears any manual override.
+func (m *Model) setHeaderStateFromTracks(tracks []playlist.Track) {
+	m.headerManual = false
+	m.headerLastAlbum = ""
+	m.headerSegments = 0
+	m.headerTracks = 0
+	m.addToHeaderState(tracks)
 }
 
-// setInitialHeaderState picks a sensible header default for a freshly loaded
-// list. Only call this when the playlist is replaced or first populated —
-// calling it after every Add re-runs the heuristic over the whole list (O(N²)
-// during incremental loads) and silently overrides the user's Ctrl+H toggle.
-func (m *Model) setInitialHeaderState(tracks []playlist.Track) {
-	m.showAlbumHeaders = isListCohesive(tracks)
+// addToHeaderState advances the cohesion counters by the newly added tracks
+// (O(k)) and refreshes header visibility, unless the user has pinned it.
+func (m *Model) addToHeaderState(tracks []playlist.Track) {
+	for _, t := range tracks {
+		if m.headerTracks == 0 || t.Album != m.headerLastAlbum {
+			m.headerSegments++
+		}
+		m.headerLastAlbum = t.Album
+		m.headerTracks++
+	}
+
+	if m.headerManual {
+		return
+	}
+	if m.headerSegments == 0 {
+		m.showAlbumHeaders = false
+		return
+	}
+	m.showAlbumHeaders = float64(m.headerTracks)/float64(m.headerSegments) >= minTracksPerAlbum
 }
 
 // trackAlbumSuffix returns the " · Album" suffix shown after track names when
@@ -318,27 +291,40 @@ func (m Model) albumSeparatorRows(tracks []playlist.Track, scroll, cursor int, s
 	return rows
 }
 
-// albumSeparator builds a full-width album divider line.
+// separatorLine pads or truncates an unstyled separator to exactly fill the playlist pane width.
+func separatorLine(line string) string {
+	if ui.PanelWidth <= 0 {
+		return ""
+	}
+	if w := lipgloss.Width(line); w < ui.PanelWidth {
+		return line + strings.Repeat("─", ui.PanelWidth-w)
+	}
+	if lipgloss.Width(line) > ui.PanelWidth {
+		return ansi.Truncate(line, ui.PanelWidth, "")
+	}
+	return line
+}
+
+// labeledSeparator builds a labeled separator line.
+func labeledSeparator(indent, label string) string {
+	return separatorLine(indent + "── " + label + " ")
+}
+
+// albumSeparator builds an album separator line.
 func (m Model) albumSeparator(album string, year int) string {
 	if album == "" {
 		return dimStyle.Render(strings.Repeat("─", ui.PanelWidth))
 	}
-	prefix := "── "
-	suffix := " "
-	label := prefix + album
+	label := album
 	if year != 0 {
 		label += fmt.Sprintf(" (%d)", year)
 	}
-	label += suffix
-	if labelLen := utf8.RuneCountInString(label); labelLen < ui.PanelWidth {
-		label += strings.Repeat("─", ui.PanelWidth-labelLen)
-	}
-	return dimStyle.Render(label)
+	return dimStyle.Render(labeledSeparator("", label))
 }
 
 // navScrollItems renders a filtered or unfiltered scrolled list for nav browsers.
 func (m Model) navScrollItems(total int, labelFn func(int) string) []string {
-	maxVisible := max(m.plVisible, 5)
+	maxVisible := m.navVisible()
 
 	useFilter := len(m.navBrowser.searchIdx) > 0 || m.navBrowser.search != ""
 	scroll := m.navBrowser.scroll
@@ -361,24 +347,4 @@ func (m Model) navScrollItems(total int, labelFn func(int) string) []string {
 	}
 
 	return padLines(lines, maxVisible, rendered)
-}
-
-// navCountLine renders an "X/Y noun (filtered)" footer.
-
-// filterHeader renders the `/` filter input line under a list title. While
-// the user is typing it shows an editable bar with a trailing cursor; once
-// the input bar is closed but a query is still active, it renders a dim recap
-// with an optional "Clear" hint. Returns nil when there's nothing to show.
-func filterHeader(searching bool, query, clearHint string) []string {
-	if searching {
-		return []string{playlistSelectedStyle.Render("  / " + query + "_"), ""}
-	}
-	if query != "" {
-		line := dimStyle.Render("  / " + query)
-		if clearHint != "" {
-			line += " " + clearHint
-		}
-		return []string{line, ""}
-	}
-	return nil
 }

@@ -34,7 +34,15 @@ const ytdlPreloadLeadTime = 15 * time.Second
 // When position has not yet reached the threshold, this function returns nil
 // and the tick loop will retry on the next pass.
 func (m *Model) preloadNext() tea.Cmd {
-	next, ok := m.playlist.PeekNext()
+	var next playlist.Track
+	var ok bool
+	if m.playbackDetached {
+		var idx int
+		next, idx = m.playlist.Current()
+		ok = idx >= 0
+	} else {
+		next, ok = m.playlist.PeekNext()
+	}
 	if !ok {
 		return nil
 	}

@@ -4,10 +4,12 @@ package resolve
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"io"
 	"io/fs"
 	"mime"
 	"net/http"
@@ -49,6 +51,15 @@ func ytdlCookiesFrom() string {
 // finite timeout to prevent hanging on unresponsive servers.
 var httpClient = &http.Client{
 	Timeout:   30 * time.Second,
+	Transport: &uaTransport{rt: http.DefaultTransport},
+}
+
+// sniffClient probes content types during Args classification, which runs on
+// the startup path before the TUI launches. It uses a short timeout so a slow
+// or unresponsive server can stall startup by at most a few seconds rather
+// than the 30s the feed/M3U client allows.
+var sniffClient = &http.Client{
+	Timeout:   5 * time.Second,
 	Transport: &uaTransport{rt: http.DefaultTransport},
 }
 
@@ -190,7 +201,7 @@ func sniffFeedURL(rawURL string) bool {
 		}
 	}
 
-	resp, err := httpClient.Head(rawURL)
+	resp, err := sniffClient.Head(rawURL)
 	if err != nil {
 		return false
 	}
@@ -290,7 +301,9 @@ func resolveFeed(feedURL string) ([]playlist.Track, error) {
 			} `xml:"item"`
 		} `xml:"channel"`
 	}
-	if err := xml.NewDecoder(resp.Body).Decode(&rss); err != nil {
+	// Bound the read so a huge or malicious feed can't exhaust memory.
+	const maxFeedBody = 32 << 20 // 32 MB
+	if err := xml.NewDecoder(io.LimitReader(resp.Body, maxFeedBody)).Decode(&rss); err != nil {
 		return nil, fmt.Errorf("parsing feed: %w", err)
 	}
 
@@ -310,7 +323,14 @@ func resolveFeed(feedURL string) ([]playlist.Track, error) {
 	return tracks, nil
 }
 
-// resolveM3U fetches an M3U playlist URL and returns tracks with EXTINF metadata.
+// maxM3UBody caps how much of a remote playlist we read before classifying it.
+// HLS/M3U playlists are tiny (a few KB); 1 MB is a generous safety bound.
+const maxM3UBody = 1 << 20
+
+// resolveM3U fetches an M3U/M3U8 URL. HLS playlists (master or media) are a
+// single live/VOD stream — not a track list — so the original URL is handed to
+// the player, where ffmpeg resolves the relative chunklist/segment URIs and
+// follows the live segment window. Plain M3U files are parsed as track lists.
 func resolveM3U(m3uURL string) ([]playlist.Track, error) {
 	resp, err := httpClient.Get(m3uURL)
 	if err != nil {
@@ -322,7 +342,23 @@ func resolveM3U(m3uURL string) ([]playlist.Track, error) {
 		return nil, fmt.Errorf("http status %s", resp.Status)
 	}
 
-	entries, err := parseM3U(resp.Body, "")
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxM3UBody))
+	if err != nil {
+		return nil, err
+	}
+
+	if isHLSPlaylist(body) {
+		// Parsing an HLS playlist as a track list would extract the relative
+		// "chunklist_*.m3u8" URI as a bogus local-file track and fail with
+		// "open source: ... no such file or directory".
+		t := playlist.TrackFromPath(m3uURL) // Stream=true; title derived from URL
+		// #EXT-X-ENDLIST only appears in media playlists, so VOD behind a
+		// master playlist is conservatively treated as live.
+		t.Realtime = !bytes.Contains(body, []byte("#EXT-X-ENDLIST"))
+		return []playlist.Track{t}, nil
+	}
+
+	entries, err := parseM3U(bytes.NewReader(body), "")
 	if err != nil {
 		return nil, err
 	}
@@ -346,6 +382,14 @@ func resolvePLS(plsURL string) ([]playlist.Track, error) {
 		return nil, err
 	}
 	return plsEntriesToTracks(entries), nil
+}
+
+// isHLSPlaylist reports whether an M3U body is an HLS playlist (master or media)
+// rather than a plain list of media URLs. HLS is identified by its #EXT-X-* tags.
+func isHLSPlaylist(body []byte) bool {
+	return bytes.Contains(body, []byte("#EXT-X-STREAM-INF")) || // master
+		bytes.Contains(body, []byte("#EXT-X-TARGETDURATION")) || // media
+		bytes.Contains(body, []byte("#EXT-X-MEDIA-SEQUENCE")) // media
 }
 
 // ytdlFlatEntry holds JSON fields from yt-dlp --flat-playlist output.
@@ -614,6 +658,11 @@ func parseItunesDuration(s string) int {
 }
 
 // humanizeBasename converts a URL basename like "clr-podcast-467" into "clr podcast 467".
+// A trailing known audio extension (e.g. "track.mp3") is dropped so it doesn't
+// leak into the title; non-media suffixes (e.g. "3.5-remix") are left intact.
 func humanizeBasename(s string) string {
+	if ext := filepath.Ext(s); ext != "" && player.SupportedExts[strings.ToLower(ext)] {
+		s = strings.TrimSuffix(s, ext)
+	}
 	return strings.ReplaceAll(s, "-", " ")
 }

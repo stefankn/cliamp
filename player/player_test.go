@@ -12,6 +12,7 @@ import (
 // lock-free getters/setters, not the audio pipeline itself.
 func newTestPlayer() *Player {
 	p := &Player{}
+	p.volMin.Store(math.Float64bits(-50))
 	p.speed.Store(math.Float64bits(1.0))
 	return p
 }
@@ -23,8 +24,8 @@ func TestSetVolumeClamps(t *testing.T) {
 		in   float64
 		want float64
 	}{
-		{-50, -30}, // below min
-		{-30, -30},
+		{-60, -50}, // below min
+		{-50, -50},
 		{0, 0},
 		{6, 6},
 		{12, 6}, // above max
@@ -34,6 +35,60 @@ func TestSetVolumeClamps(t *testing.T) {
 		if got := p.Volume(); got != tt.want {
 			t.Errorf("SetVolume(%v) → Volume() = %v, want %v", tt.in, got, tt.want)
 		}
+	}
+}
+
+func TestSetVolumeMinClamps(t *testing.T) {
+	p := newTestPlayer()
+
+	tests := []struct {
+		in   float64
+		want float64
+	}{
+		{-100, -90}, // below absolute floor
+		{-90, -90},
+		{-50, -50},
+		{0, 0},
+		{5, 0}, // above max (must be ≤ 0)
+	}
+	for _, tt := range tests {
+		p.SetVolumeMin(tt.in)
+		if got := p.VolumeMin(); got != tt.want {
+			t.Errorf("SetVolumeMin(%v) → VolumeMin() = %v, want %v", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestSetVolumeMinReconcilesCurrent(t *testing.T) {
+	p := newTestPlayer()
+	p.SetVolume(-40)
+	p.SetVolumeMin(-30) // raise floor above current volume
+	if got := p.Volume(); got != -30 {
+		t.Errorf("Volume after SetVolumeMin raise = %v, want -30", got)
+	}
+}
+
+func TestVolumeClampedToCustomMin(t *testing.T) {
+	tests := []struct {
+		name      string
+		volumeMin float64
+		volume    float64
+		want      float64
+	}{
+		{"below floor", -30, -40, -30},
+		{"at floor", -30, -30, -30},
+		{"above floor", -30, -10, -10},
+		{"custom floor -60", -60, -70, -60},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := newTestPlayer()
+			p.SetVolumeMin(tt.volumeMin)
+			p.SetVolume(tt.volume)
+			if got := p.Volume(); got != tt.want {
+				t.Errorf("Volume = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 

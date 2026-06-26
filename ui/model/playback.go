@@ -12,9 +12,19 @@ import (
 // nextTrack advances to the next playlist track and starts playing it.
 // Unplayable tracks are skipped automatically.
 func (m *Model) nextTrack() tea.Cmd {
+	if m.playbackDetached {
+		m.playbackDetached = false
+		if m.playlist.Len() == 0 {
+			m.player.Stop()
+			m.clearPlaybackTrack()
+			return nil
+		}
+		return m.playCurrentTrack()
+	}
 	track, ok := m.playlist.Next()
 	if !ok {
 		m.player.Stop()
+		m.clearPlaybackTrack()
 		return nil
 	}
 	m.plCursor = m.playlist.Index()
@@ -31,7 +41,7 @@ func (m *Model) prevTrack() tea.Cmd {
 			m.player.Seek(-m.player.Position())
 			return nil
 		}
-		track, idx := m.playlist.Current()
+		track, idx := m.currentPlaybackTrack()
 		if idx >= 0 {
 			return m.playTrack(track)
 		}
@@ -69,6 +79,7 @@ func (m *Model) playCurrentTrack() tea.Cmd {
 	activation, ok := m.playlist.ActivateSelected()
 	if !ok {
 		m.player.Stop()
+		m.clearPlaybackTrack()
 		m.status.Show("No available tracks", statusTTLDefault)
 		return nil
 	}
@@ -86,6 +97,7 @@ func (m *Model) playTrackImmediate(track playlist.Track) tea.Cmd {
 	m.player.Stop()
 	m.player.ClearPreload()
 	m.playlist.Add(track)
+	m.addToHeaderState([]playlist.Track{track})
 	idx := m.playlist.Len() - 1
 	m.playlist.SetIndex(idx)
 	m.plCursor = idx
@@ -100,6 +112,7 @@ func (m *Model) playTrackImmediate(track playlist.Track) tea.Cmd {
 func (m *Model) appendTrack(track playlist.Track) tea.Cmd {
 	wasEmpty := m.playlist.Len() == 0
 	m.playlist.Add(track)
+	m.addToHeaderState([]playlist.Track{track})
 	idx := m.playlist.Len() - 1
 	m.status.Showf(statusTTLMedium, "Added: %s", track.DisplayName())
 	if wasEmpty || !m.player.IsPlaying() {
@@ -129,6 +142,7 @@ func (m *Model) closeSpotSearch() {
 // queueTrackNext adds a track to the playlist and queues it to play next.
 func (m *Model) queueTrackNext(track playlist.Track) tea.Cmd {
 	m.playlist.Add(track)
+	m.addToHeaderState([]playlist.Track{track})
 	idx := m.playlist.Len() - 1
 	m.playlist.Queue(idx)
 	m.status.Showf(statusTTLMedium, "Queued: %s", track.DisplayName())
@@ -156,6 +170,7 @@ func (m *Model) removeSelectedFromPlaylist() {
 	if wasActive {
 		m.player.Stop()
 		m.player.ClearPreload()
+		m.clearPlaybackTrack()
 	}
 	if newLen := m.playlist.Len(); newLen == 0 {
 		m.plCursor = 0
@@ -176,6 +191,7 @@ func (m *Model) playTrack(track playlist.Track) tea.Cmd {
 		return resolveFeedTrackCmd(track.Path)
 	}
 
+	m.setPlaybackTrack(track)
 	m.reconnect.attempts = 0
 	m.reconnect.at = time.Time{}
 	m.streamTitle = ""
@@ -250,7 +266,7 @@ func (m *Model) togglePlayPause() tea.Cmd {
 		return m.playCurrentTrack()
 	}
 	if m.player.IsPaused() {
-		track, idx := m.playlist.Current()
+		track, idx := m.currentPlaybackTrack()
 		if shouldReconnectOnUnpause(track, idx) {
 			m.player.Stop()
 			return m.playTrack(track)
@@ -273,7 +289,7 @@ func (m *Model) applyResume() {
 	if m.resume.path == "" || m.resume.secs <= 0 {
 		return
 	}
-	track, _ := m.playlist.Current()
+	track, _ := m.currentPlaybackTrack()
 	if track.Path != m.resume.path {
 		return
 	}

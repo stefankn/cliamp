@@ -10,7 +10,7 @@ import (
 
 // tap is a streamer wrapper that copies samples into a ring buffer
 // for real-time FFT visualization. It sits in the audio pipeline
-// between the volume control and the speaker controller.
+// before the volume control so the visualizer sees pre-volume amplitude.
 //
 // The write position is updated atomically, allowing the audio thread
 // (sole writer) and the UI thread (infrequent reader at 50ms intervals)

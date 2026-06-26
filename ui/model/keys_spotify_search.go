@@ -56,23 +56,32 @@ func (m *Model) handleSpotSearchInputKey(msg tea.KeyPressMsg) tea.Cmd {
 	return nil
 }
 
+func (m *Model) spotSearchResultsMaybeAdjustScroll(visible int) {
+	clampScroll(&m.spotSearch.cursor, &m.spotSearch.scroll, len(m.spotSearch.results), visible)
+}
+
 // handleSpotSearchResultsKey handles navigation through search results.
 func (m *Model) handleSpotSearchResultsKey(msg tea.KeyPressMsg) tea.Cmd {
 	count := len(m.spotSearch.results)
 
 	switch msg.String() {
-	case "up", "k":
+	case "ctrl+x":
+		m.toggleExpandedView()
+		m.spotSearchResultsMaybeAdjustScroll(m.spotSearchResultsVisible())
+	case "up", "k", "ctrl+p":
 		if m.spotSearch.cursor > 0 {
 			m.spotSearch.cursor--
 		} else if count > 0 {
 			m.spotSearch.cursor = count - 1
 		}
-	case "down", "j":
+		m.spotSearchResultsMaybeAdjustScroll(m.spotSearchResultsVisible())
+	case "down", "j", "ctrl+n":
 		if m.spotSearch.cursor < count-1 {
 			m.spotSearch.cursor++
 		} else if count > 0 {
 			m.spotSearch.cursor = 0
 		}
+		m.spotSearchResultsMaybeAdjustScroll(m.spotSearchResultsVisible())
 	case "enter":
 		if count > 0 && !m.spotSearch.loading {
 			track := m.spotSearch.results[m.spotSearch.cursor]
@@ -101,8 +110,34 @@ func (m *Model) handleSpotSearchResultsKey(msg tea.KeyPressMsg) tea.Cmd {
 	case "esc", "backspace":
 		m.spotSearch.screen = spotSearchInput
 		m.spotSearch.err = ""
+	case "ctrl+u":
+		step := m.spotSearchResultsVisible()
+		if step < 1 {
+			step = 1
+		}
+		if m.spotSearch.cursor >= step {
+			m.spotSearch.cursor -= step
+		} else {
+			m.spotSearch.cursor = 0
+		}
+		m.spotSearchResultsMaybeAdjustScroll(m.spotSearchResultsVisible())
+	case "ctrl+d":
+		step := m.spotSearchResultsVisible()
+		if step < 1 {
+			step = 1
+		}
+		m.spotSearch.cursor += step
+		if m.spotSearch.cursor >= count {
+			m.spotSearch.cursor = max(0, count-1)
+		}
+		m.spotSearchResultsMaybeAdjustScroll(m.spotSearchResultsVisible())
 	}
 	return nil
+}
+
+func (m *Model) spotSearchPlaylistMaybeAdjustScroll(visible int) {
+	count := len(m.spotSearch.playlists) + 1
+	clampScroll(&m.spotSearch.cursor, &m.spotSearch.scroll, count, visible)
 }
 
 // handleSpotSearchPlaylistKey handles picking a playlist to add to.
@@ -110,18 +145,23 @@ func (m *Model) handleSpotSearchPlaylistKey(msg tea.KeyPressMsg) tea.Cmd {
 	count := len(m.spotSearch.playlists) + 1 // +1 for "+ New Playlist..."
 
 	switch msg.String() {
+	case "ctrl+x":
+		m.toggleExpandedView()
+		m.spotSearchPlaylistMaybeAdjustScroll(m.spotSearchPlaylistVisible())
 	case "up", "k":
 		if m.spotSearch.cursor > 0 {
 			m.spotSearch.cursor--
 		} else if count > 0 {
 			m.spotSearch.cursor = count - 1
 		}
+		m.spotSearchPlaylistMaybeAdjustScroll(m.spotSearchPlaylistVisible())
 	case "down", "j":
 		if m.spotSearch.cursor < count-1 {
 			m.spotSearch.cursor++
 		} else if count > 0 {
 			m.spotSearch.cursor = 0
 		}
+		m.spotSearchPlaylistMaybeAdjustScroll(m.spotSearchPlaylistVisible())
 	case "enter":
 		if m.spotSearch.loading {
 			return nil
@@ -145,9 +185,11 @@ func (m *Model) handleSpotSearchPlaylistKey(msg tea.KeyPressMsg) tea.Cmd {
 		m.spotSearch.screen = spotSearchNewName
 		m.spotSearch.newName = ""
 		m.spotSearch.cursor = 0
+		m.spotSearch.scroll = 0
 	case "esc", "backspace":
 		m.spotSearch.screen = spotSearchResults
 		m.spotSearch.cursor = 0
+		m.spotSearch.scroll = 0
 		m.spotSearch.err = ""
 	}
 	return nil
@@ -159,6 +201,7 @@ func (m *Model) handleSpotSearchNewNameKey(msg tea.KeyPressMsg) tea.Cmd {
 	case tea.KeyEscape:
 		m.spotSearch.screen = spotSearchPlaylist
 		m.spotSearch.cursor = len(m.spotSearch.playlists)
+		m.spotSearchPlaylistMaybeAdjustScroll(m.spotSearchPlaylistVisible())
 	case tea.KeyEnter:
 		if m.spotSearch.newName != "" && !m.spotSearch.loading {
 			c, cOk := m.spotSearch.prov.(provider.PlaylistCreator)

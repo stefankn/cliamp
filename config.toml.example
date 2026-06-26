@@ -1,8 +1,15 @@
 # CLIAMP configuration
 # Copy to ~/.config/cliamp/config.toml
 
-# Default volume in dB (range: -30 to 6)
+# Default volume in dB (range: volume_min to +6)
 volume = 0
+
+# Minimum volume floor in dB (range: -90 to 0, default: -50)
+# volume_min = -50
+
+# Whether the visualizer bar height follows the current volume (default: true).
+# Set to false to keep bars visible at low volumes.
+# vis_volume_linked = true
 
 # Repeat mode: "off", "all", or "one"
 repeat = "off"
@@ -47,6 +54,9 @@ eq = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 
 # Visualizer mode: Bars, BarsDot, Rain, BarsOutline, Bricks, Columns, ClassicPeak, Wave, Scatter, Flame, Retro, Pulse, Matrix, Binary, Sakura, Firework, Bubbles, Logo, Terrain, Scope, Heartbeat, Butterfly, Ascii, Firefly, Mosaic, Sand, or None
 # visualizer = "Bars"
+
+# Reduce CPU usage by lowering UI cadence and disabling visualization.
+# low_power = false
 
 # Log level: "debug", "info", "warn", or "error" (default "info")
 # Logs are written to ~/.config/cliamp/cliamp.log

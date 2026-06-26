@@ -1,6 +1,7 @@
 package model
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -10,8 +11,10 @@ import (
 )
 
 type playbackFakeEngine struct {
-	playing   bool
-	playCalls []string
+	playing           bool
+	playCalls         []string
+	preloadCalls      []string
+	clearPreloadCalls int
 }
 
 func (f *playbackFakeEngine) Play(path string, _ time.Duration) error {
@@ -19,10 +22,13 @@ func (f *playbackFakeEngine) Play(path string, _ time.Duration) error {
 	f.playCalls = append(f.playCalls, path)
 	return nil
 }
-func (f *playbackFakeEngine) PlayYTDL(string, time.Duration) error    { return nil }
-func (f *playbackFakeEngine) Preload(string, time.Duration) error     { return nil }
+func (f *playbackFakeEngine) PlayYTDL(string, time.Duration) error { return nil }
+func (f *playbackFakeEngine) Preload(path string, _ time.Duration) error {
+	f.preloadCalls = append(f.preloadCalls, path)
+	return nil
+}
 func (f *playbackFakeEngine) PreloadYTDL(string, time.Duration) error { return nil }
-func (f *playbackFakeEngine) ClearPreload()                           {}
+func (f *playbackFakeEngine) ClearPreload()                           { f.clearPreloadCalls++ }
 func (f *playbackFakeEngine) Stop()                                   { f.playing = false }
 func (f *playbackFakeEngine) Close()                                  {}
 func (f *playbackFakeEngine) TogglePause()                            {}
@@ -42,6 +48,8 @@ func (f *playbackFakeEngine) Duration() time.Duration                 { return 0
 func (f *playbackFakeEngine) PositionAndDuration() (time.Duration, time.Duration) {
 	return 0, 0
 }
+func (f *playbackFakeEngine) SetVolumeMin(float64)                   {}
+func (f *playbackFakeEngine) VolumeMin() float64                     { return -50 }
 func (f *playbackFakeEngine) SetVolume(float64)                      {}
 func (f *playbackFakeEngine) Volume() float64                        { return 0 }
 func (f *playbackFakeEngine) SetSpeed(float64)                       {}
@@ -189,5 +197,86 @@ func TestPlayCurrentTrackUnplayableStopsWhenNoReplacementExists(t *testing.T) {
 	}
 	if m.status.text != "No available tracks" {
 		t.Fatalf("status.text = %q, want %q", m.status.text, "No available tracks")
+	}
+}
+
+func modelAfterProviderPlaylistLoadWhilePlaying(t *testing.T) (Model, *playbackFakeEngine) {
+	t.Helper()
+
+	player := &playbackFakeEngine{playing: true}
+	p := playlist.New()
+	p.Replace([]playlist.Track{
+		{Title: "Old", Path: "old.mp3", DurationSecs: 180},
+	})
+	p.SetIndex(0)
+
+	m := Model{
+		player:   player,
+		playlist: p,
+		vis:      ui.NewVisualizer(float64(player.SampleRate())),
+	}
+
+	updated, _ := m.Update(tracksLoadedMsg{
+		{Title: "New 1", Path: "new1.mp3", DurationSecs: 180},
+		{Title: "New 2", Path: "new2.mp3", DurationSecs: 180},
+	})
+	m = updated.(Model)
+
+	return m, player
+}
+
+func TestProviderPlaylistLoadWhilePlayingKeepsNowPlayingTrack(t *testing.T) {
+	m, player := modelAfterProviderPlaylistLoadWhilePlaying(t)
+
+	track, idx := m.currentPlaybackTrack()
+	if idx < 0 || track.Title != "Old" {
+		t.Fatalf("currentPlaybackTrack() = (%q,%d), want old playing track", track.Title, idx)
+	}
+	if !m.playbackDetached {
+		t.Fatal("playbackDetached = false, want true")
+	}
+	if player.clearPreloadCalls != 1 {
+		t.Fatalf("ClearPreload calls = %d, want 1", player.clearPreloadCalls)
+	}
+	tracks := m.playlist.Tracks()
+	if len(tracks) != 2 || tracks[0].Title != "New 1" || tracks[1].Title != "New 2" {
+		t.Fatalf("playlist tracks = %#v, want new provider playlist only", tracks)
+	}
+	if info := m.renderTrackInfo(); !strings.Contains(info, "Old") {
+		t.Fatalf("renderTrackInfo() = %q, want old playing track", info)
+	}
+}
+
+func TestNextAfterProviderPlaylistLoadStartsFirstNewTrack(t *testing.T) {
+	m, player := modelAfterProviderPlaylistLoadWhilePlaying(t)
+
+	cmd := m.nextTrack()
+	if cmd != nil {
+		_ = cmd()
+	}
+
+	if len(player.playCalls) == 0 || player.playCalls[0] != "new1.mp3" {
+		t.Fatalf("playCalls = %v, want first new track", player.playCalls)
+	}
+	if m.playbackDetached {
+		t.Fatal("playbackDetached = true, want false")
+	}
+	track, _ := m.currentPlaybackTrack()
+	if track.Title != "New 1" {
+		t.Fatalf("currentPlaybackTrack() = %q, want New 1", track.Title)
+	}
+}
+
+func TestPreloadAfterProviderPlaylistLoadUsesFirstNewTrack(t *testing.T) {
+	m, player := modelAfterProviderPlaylistLoadWhilePlaying(t)
+
+	cmd := m.preloadNext()
+	if cmd == nil {
+		t.Fatal("preloadNext() = nil, want preload command")
+	}
+	_ = cmd()
+
+	if len(player.preloadCalls) != 1 || player.preloadCalls[0] != "new1.mp3" {
+		t.Fatalf("preloadCalls = %v, want first new track", player.preloadCalls)
 	}
 }

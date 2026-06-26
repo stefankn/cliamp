@@ -143,7 +143,7 @@ func (m Model) terminalTitleValues() terminalTitleValues {
 	if m.playlist == nil {
 		return terminalTitleStateValues(m.isPlaying(), m.isPaused())
 	}
-	track, idx := m.playlist.Current()
+	track, idx := m.currentPlaybackTrack()
 	if idx < 0 {
 		return terminalTitleStateValues(m.isPlaying(), m.isPaused())
 	}

@@ -64,6 +64,7 @@ const (
 	VisMosaic                     // static heatmap of flickering tiles
 	VisSand                       // falling-sand cellular automaton
 	VisGeyser                     // bass-driven particle fountain
+	VisClassicLED                 // Winamp 2.9 LED matrix with falling peak caps
 	VisNone                       // hidden — no visualizer
 	VisCount                      // sentinel for cycling
 )
@@ -462,6 +463,7 @@ var visModes = [VisCount]visEntry{
 	VisMosaic:      {"Mosaic", newMosaicDriver},
 	VisSand:        {"Sand", newSandDriver},
 	VisGeyser:      {"Geyser", newGeyserDriver},
+	VisClassicLED:  {"ClassicLED", newClassicLEDDriver},
 	VisNone:        {"None", newNoOpDriver},
 }
 
@@ -499,6 +501,24 @@ func VisModeNames() []string {
 		names[i] = visModes[i].name
 	}
 	return names
+}
+
+// AllModeNames returns the display names of every selectable visualizer mode in
+// cycle order: built-in modes followed by any registered Lua visualizers. The
+// index of each name equals its VisMode value, so a picker can map a list row
+// directly to a mode.
+func (v *Visualizer) AllModeNames() []string {
+	return append(VisModeNames(), v.luaVisNames...)
+}
+
+// SetMode switches to mode if it is within range (built-in or Lua) and requests
+// a refresh. Out-of-range values are ignored, matching the SetVisualizer guard.
+func (v *Visualizer) SetMode(mode VisMode) {
+	if mode < 0 || mode >= VisCount+VisMode(len(v.luaVisNames)) {
+		return
+	}
+	v.Mode = mode
+	v.RequestRefresh()
 }
 
 func buildSpectrumEdges(count int) []float64 {

@@ -27,10 +27,11 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// TestTickIntervalStoppedUsesSlow verifies that when the player is stopped,
-// the tick interval is ui.TickSlow (~200ms) not ui.TickFast (~50ms), regardless of
-// the visualizer mode. This matters for CPU usage (issue #92).
-func TestTickIntervalStoppedUsesSlow(t *testing.T) {
+// TestTickIntervalStoppedUsesIdle verifies that a fully-idle model (player
+// stopped, no overlay, no pending status / reconnect) ticks at ui.TickIdle
+// rather than ui.TickSlow / ui.TickFast. This is what lets the CPU sit in a
+// low P-state between user actions (issue #92 and follow-ups).
+func TestTickIntervalStoppedUsesIdle(t *testing.T) {
 	if sharedPlayer == nil {
 		t.Skip("audio hardware unavailable")
 	}
@@ -41,31 +42,66 @@ func TestTickIntervalStoppedUsesSlow(t *testing.T) {
 		termTitle: terminalTitleState{},
 	}
 
-	// Player is stopped by default (IsPlaying=false).
-	// vis.Mode defaults to ui.VisBars (0 != ui.VisNone).
 	if sharedPlayer.IsPlaying() {
 		t.Fatal("expected player to be stopped")
 	}
-	if m.vis.Mode == ui.VisNone {
-		t.Fatal("expected default vis mode to be non-None (ui.VisBars)")
+	if !m.isFullyIdle() {
+		t.Fatal("isFullyIdle() = false on a fresh stopped model, want true")
 	}
-
-	_, cmd := m.Update(tickMsg(time.Now()))
-	if cmd == nil {
-		t.Fatal("tickMsg returned nil cmd")
+	if got := m.tickInterval(); got != ui.TickIdle {
+		t.Errorf("tickInterval() = %v, want %v (ui.TickIdle)", got, ui.TickIdle)
 	}
+}
 
-	start := time.Now()
-	cmd() // blocks until the tick timer fires
-	elapsed := time.Since(start)
-
-	// ui.TickSlow=200ms, ui.TickFast=50ms. With tolerance for scheduling jitter.
-	const tolerance = 80 * time.Millisecond
-	if elapsed < ui.TickSlow-tolerance {
-		t.Errorf("tick fired after %v, want ~%v (ui.TickSlow); got ui.TickFast instead — CPU fix not working",
-			elapsed, ui.TickSlow)
+// TestTickIntervalPendingStatusUsesSlow verifies that a pending status
+// message keeps us off the idle cadence — otherwise the message would linger
+// up to TickIdle past its expiry.
+func TestTickIntervalPendingStatusUsesSlow(t *testing.T) {
+	if sharedPlayer == nil {
+		t.Skip("audio hardware unavailable")
 	}
-	t.Logf("tick interval when stopped: %v (want ~%v ui.TickSlow)", elapsed.Round(time.Millisecond), ui.TickSlow)
+	m := Model{
+		player:   sharedPlayer,
+		vis:      ui.NewVisualizer(float64(sharedPlayer.SampleRate())),
+		playlist: playlist.New(),
+	}
+	m.status.Show("hello", statusTTL(2*time.Second))
+
+	if m.isFullyIdle() {
+		t.Fatal("isFullyIdle() = true with pending status message, want false")
+	}
+	if got := m.tickInterval(); got == ui.TickIdle {
+		t.Errorf("tickInterval() = %v with pending status, want a faster cadence", got)
+	}
+}
+
+func TestTickIntervalPlayingUsesFastCadence(t *testing.T) {
+	p := &playbackFakeEngine{playing: true}
+	m := Model{
+		player:   p,
+		vis:      ui.NewVisualizer(float64(p.SampleRate())),
+		playlist: playlist.New(),
+	}
+	m.SetVisualizer("none")
+
+	if got := m.tickInterval(); got != ui.TickFast {
+		t.Fatalf("tickInterval() = %v, want %v", got, ui.TickFast)
+	}
+}
+
+func TestTickIntervalLowPowerPlayingUsesLowPowerCadence(t *testing.T) {
+	p := &playbackFakeEngine{playing: true}
+	m := Model{
+		player:   p,
+		vis:      ui.NewVisualizer(float64(p.SampleRate())),
+		playlist: playlist.New(),
+	}
+	m.SetVisualizer("none")
+	m.SetLowPower(true)
+
+	if got := m.tickInterval(); got != ui.TickLowPowerPlaying {
+		t.Fatalf("tickInterval() = %v, want %v", got, ui.TickLowPowerPlaying)
+	}
 }
 
 func TestInitialTickUsesFastCadence(t *testing.T) {
@@ -116,7 +152,7 @@ func TestRefreshVisualizerIfPendingConsumesOneShotRequest(t *testing.T) {
 	}
 }
 
-func TestLyricsScreenHidesVisualizerTicks(t *testing.T) {
+func TestLyricsScreenKeepsVisualizerLive(t *testing.T) {
 	m := Model{
 		vis: ui.NewVisualizer(44100),
 		lyrics: lyricsState{
@@ -127,21 +163,23 @@ func TestLyricsScreenHidesVisualizerTicks(t *testing.T) {
 	if got := m.activeScreen(); got != screenLyrics {
 		t.Fatalf("activeScreen() = %v, want %v", got, screenLyrics)
 	}
-	if !m.isOverlayActive() {
-		t.Fatal("isOverlayActive() = false, want true while lyrics screen is visible")
+	// Overlays now render inline over the live main view, so the visualizer is
+	// never treated as hidden.
+	if m.isOverlayActive() {
+		t.Fatal("isOverlayActive() = true, want false: overlays render inline")
 	}
-	if !m.visualizerTickContext(time.Now()).OverlayActive {
-		t.Fatal("visualizerTickContext(...).OverlayActive = false, want true for lyrics screen")
+	if m.visualizerTickContext(time.Now()).OverlayActive {
+		t.Fatal("visualizerTickContext(...).OverlayActive = true, want false for inline lyrics")
 	}
 
 	m.vis.RequestRefresh()
 	m.refreshVisualizerIfPending()
 
-	if !m.vis.RefreshPending() {
-		t.Fatal("refreshPending = false after lyrics-screen refresh attempt, want true")
+	if m.vis.RefreshPending() {
+		t.Fatal("refreshPending = true after refresh, want false: visualizer stays live under lyrics")
 	}
-	if m.vis.Frame() != 0 {
-		t.Fatalf("frame after lyrics-screen refresh attempt = %d, want 0", m.vis.Frame())
+	if m.vis.Frame() != 1 {
+		t.Fatalf("frame after refresh = %d, want 1 while lyrics open", m.vis.Frame())
 	}
 }
 

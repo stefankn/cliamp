@@ -20,6 +20,7 @@ import (
 	"cliamp/external/netease"
 	"cliamp/external/plex"
 	"cliamp/external/radio"
+	"cliamp/external/radiometa"
 	"cliamp/external/soundcloud"
 	"cliamp/external/spotify"
 	"cliamp/external/ytmusic"
@@ -40,6 +41,11 @@ import (
 
 // version is set at build time via -ldflags "-X main.version=vX.Y.Z".
 var version string
+
+const (
+	defaultUIFPS  = 20
+	lowPowerUIFPS = 5
+)
 
 func run(overrides config.Overrides, positional []string, daemon bool) error {
 	cfg, err := config.Load()
@@ -93,7 +99,11 @@ func run(overrides config.Overrides, positional []string, daemon bool) error {
 	if cfg.Spotify.IsSet() {
 		clientID := cfg.Spotify.ResolveClientID(spotify.DefaultClientID)
 		spotifyProv = spotify.New(nil, clientID, cfg.Spotify.Bitrate)
-		providers = append(providers, model.ProviderEntry{Key: "spotify", Name: "Spotify", Provider: spotifyProv})
+		if spotifyProv != nil {
+			providers = append(providers, model.ProviderEntry{Key: "spotify", Name: "Spotify", Provider: spotifyProv})
+		} else {
+			fmt.Fprintln(os.Stderr, "Spotify is unavailable in this Windows build.")
+		}
 	}
 
 	if scProv := soundcloud.NewFromConfig(soundcloud.Config{
@@ -211,7 +221,6 @@ func run(overrides config.Overrides, positional []string, daemon bool) error {
 			return fmt.Errorf("playlist %q: %w", cfg.Playlist, err)
 		}
 		pl.Add(tracks...)
-		cfg.AutoPlay = true
 	} else if defaultRadio {
 		pl.Add(
 			playlist.Track{Path: "http://radio.cliamp.stream/lofi/stream", Title: "Lofi Stream", Stream: true},
@@ -220,6 +229,18 @@ func run(overrides config.Overrides, positional []string, daemon bool) error {
 		)
 	}
 	pl.Add(resolved.Tracks...)
+
+	// Daemon mode has no UI loop to drain pending URLs (feeds, M3U, yt-dlp),
+	// so resolve them synchronously here. The TUI path does this in the
+	// background via m.SetPendingURLs.
+	if daemon && len(resolved.Pending) > 0 {
+		fmt.Fprintf(os.Stderr, "cliamp: resolving %d remote URL(s)...\n", len(resolved.Pending))
+		remote, err := resolve.Remote(resolved.Pending)
+		if err != nil {
+			return fmt.Errorf("resolve remote: %w", err)
+		}
+		pl.Add(remote...)
+	}
 
 	if cfg.AudioDevice != "" {
 		cleanup := player.PrepareAudioDevice(cfg.AudioDevice)
@@ -254,6 +275,9 @@ func run(overrides config.Overrides, positional []string, daemon bool) error {
 		return navidrome.IsSubsonicStreamURL(u) || jellyfin.IsStreamURL(u) || emby.IsStreamURL(u) || plex.IsStreamURL(u) || strings.HasPrefix(u, strings.TrimRight(cfg.Finch.URL, "/"))
 	})
 
+	// Pull now-playing for stations that carry no inline ICY metadata (NTS, FIP).
+	p.RegisterStreamMetadataResolver(radiometa.Resolver)
+
 	cfg.ApplyPlayer(p)
 	cfg.ApplyPlaylist(pl)
 	ui.SetPadding(cfg.PaddingH, cfg.PaddingV)
@@ -274,6 +298,7 @@ func run(overrides config.Overrides, positional []string, daemon bool) error {
 	}
 
 	m := model.New(p, pl, providers, defaultProvider, localProv, themes, luaMgr, config.SaveFunc{})
+	m.SetVisVolumeLinked(cfg.VisVolumeLinked)
 
 	if luaMgr != nil {
 		luaMgr.SetStateProvider(luaplugin.StateProvider{
@@ -305,6 +330,21 @@ func run(overrides config.Overrides, positional []string, daemon bool) error {
 			TrackDuration: func() int { t, _ := pl.Current(); return t.DurationSecs },
 			PlaylistCount: func() int { return pl.Len() },
 			CurrentIndex:  func() int { return pl.Index() },
+			QueueList: func() []luaplugin.QueueEntry {
+				tracks := pl.Tracks()
+				out := make([]luaplugin.QueueEntry, len(tracks))
+				for i, t := range tracks {
+					out[i] = luaplugin.QueueEntry{
+						Title:  t.Title,
+						Artist: t.Artist,
+						Album:  t.Album,
+						Path:   t.Path,
+						Index:  i,
+						Queued: pl.QueuePosition(i) >= 0,
+					}
+				}
+				return out
+			},
 		})
 	}
 
@@ -332,6 +372,9 @@ func run(overrides config.Overrides, positional []string, daemon bool) error {
 	if cfg.AutoPlay {
 		m.SetAutoPlay(true)
 	}
+	if cfg.LowPower {
+		m.SetLowPower(true)
+	}
 	if cfg.Compact {
 		m.SetCompact(true)
 	}
@@ -342,7 +385,11 @@ func run(overrides config.Overrides, positional []string, daemon bool) error {
 		}
 	}
 
-	prog := tea.NewProgram(m)
+	progOpts := []tea.ProgramOption{tea.WithFPS(defaultUIFPS)}
+	if cfg.LowPower {
+		progOpts[0] = tea.WithFPS(lowPowerUIFPS)
+	}
+	prog := tea.NewProgram(m, progOpts...)
 
 	if spotifyProv != nil {
 		spotify.SetAuthURLObserver(func(u string) {
@@ -352,7 +399,9 @@ func run(overrides config.Overrides, positional []string, daemon bool) error {
 	}
 
 	svc, svcErr := wireMediaCtl(prog)
-	if svcErr == nil && svc != nil {
+	if svcErr != nil {
+		applog.Warn("media control (MPRIS/NowPlaying) unavailable: %v", svcErr)
+	} else if svc != nil {
 		defer svc.Close()
 	}
 
@@ -372,6 +421,18 @@ func run(overrides config.Overrides, positional []string, daemon bool) error {
 			},
 			Next: func() { prog.Send(playback.NextMsg{}) },
 			Prev: func() { prog.Send(playback.PrevMsg{}) },
+			QueueAdd: func(path string) {
+				prog.Send(model.PluginQueueMsg{Op: "add", Path: path})
+			},
+			QueueJump: func(index int) {
+				prog.Send(model.PluginQueueMsg{Op: "jump", Index: index})
+			},
+			QueueRemove: func(index int) {
+				prog.Send(model.PluginQueueMsg{Op: "remove", Index: index})
+			},
+			QueueMove: func(from, to int) {
+				prog.Send(model.PluginQueueMsg{Op: "move", Index: from, To: to})
+			},
 		})
 		luaMgr.SetUIProvider(luaplugin.UIProvider{
 			ShowMessage: func(text string, duration time.Duration) {

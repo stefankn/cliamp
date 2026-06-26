@@ -22,6 +22,18 @@ PLS playlist files are supported alongside M3U:
 cliamp https://radio.cliamp.stream/lofi/stream.pls
 ```
 
+## HLS Streams
+
+HLS playlists (`.m3u8`, master or media) are supported, as used by large broadcasters such as Brazilian RBS/Wowza stations:
+
+```sh
+cliamp "https://example.com/live/playlist.m3u8"
+```
+
+cliamp hands the URL to ffmpeg, which resolves the relative chunklist/segment URIs and follows the live segment window. Requires `ffmpeg` (already needed for AAC/Opus).
+
+Live HLS carries timed metadata rather than inline ICY, so the now-playing track title isn't updated for HLS streams.
+
 ## Podcasts
 
 Play any podcast by passing its RSS feed URL:
@@ -43,6 +55,19 @@ cliamp https://www.xiaoyuzhoufm.com/episode/xxxx
 ## Radio Catalog
 
 Press `R` in the player to browse and search 30,000+ online radio stations from the [Radio Browser](https://www.radio-browser.info/) directory. Use `/` to search by name, `Enter` to play, and `a` to append a station to the playlist.
+
+## Track Info
+
+For live radio, cliamp shows the current track from the stream's inline ICY metadata (`StreamTitle`). This works for most stations, in any codec (MP3, AAC, Opus, ...).
+
+Some broadcasters send no inline metadata and publish now-playing through a separate API instead. cliamp pulls those automatically:
+
+| Station | Source | Shown |
+| --- | --- | --- |
+| FIP (and FIP Jazz, Rock, Groove, Reggae, Electro, Metal, Monde, Nouveautes) | Radio France livemeta API | Artist - Title |
+| NTS 1 / NTS 2 | NTS live API | Current show |
+
+NTS is live DJ radio with no per-track tagging, so it shows the show/host name rather than a song.
 
 ## Load URL at Runtime
 

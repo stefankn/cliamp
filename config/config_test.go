@@ -58,15 +58,65 @@ func TestClampVolume(t *testing.T) {
 		want float64
 	}{
 		{"within range", -10, -10},
-		{"too low", -50, -30},
+		{"too low", -60, -50},
 		{"too high", 20, 6},
-		{"min boundary", -30, -30},
+		{"min boundary", -50, -50},
 		{"max boundary", 6, 6},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := defaultConfig()
 			cfg.Volume = tt.vol
+			cfg.clamp()
+			if cfg.Volume != tt.want {
+				t.Errorf("Volume = %f, want %f", cfg.Volume, tt.want)
+			}
+		})
+	}
+}
+
+func TestClampVolumeMin(t *testing.T) {
+	tests := []struct {
+		name string
+		min  float64
+		want float64
+	}{
+		{"default", -50, -50},
+		{"custom valid", -70, -70},
+		{"too low", -100, -90},
+		{"too high positive", 5, 0},
+		{"zero boundary", 0, 0},
+		{"low boundary", -90, -90},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := defaultConfig()
+			cfg.VolumeMin = tt.min
+			cfg.clamp()
+			if cfg.VolumeMin != tt.want {
+				t.Errorf("VolumeMin = %f, want %f", cfg.VolumeMin, tt.want)
+			}
+		})
+	}
+}
+
+func TestVolumeClampedToVolumeMin(t *testing.T) {
+	tests := []struct {
+		name      string
+		volumeMin float64
+		volume    float64
+		want      float64
+	}{
+		{"below floor", -30, -40, -30},
+		{"at floor", -30, -30, -30},
+		{"above floor", -30, -10, -10},
+		{"custom floor -60", -60, -70, -60},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := defaultConfig()
+			cfg.VolumeMin = tt.volumeMin
+			cfg.Volume = tt.volume
 			cfg.clamp()
 			if cfg.Volume != tt.want {
 				t.Errorf("Volume = %f, want %f", cfg.Volume, tt.want)
@@ -560,14 +610,31 @@ func TestOverridesApplyClamps(t *testing.T) {
 	}
 }
 
-// Mock player for ApplyPlayer tests
-type mockPlayer struct {
-	volume float64
-	speed  float64
-	eq     [10]float64
-	mono   bool
+func TestOverridesApplyLowPower(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Visualizer = "Bars"
+	lowPower := true
+
+	Overrides{LowPower: &lowPower}.Apply(&cfg)
+
+	if !cfg.LowPower {
+		t.Fatal("LowPower = false, want true")
+	}
+	if cfg.Visualizer != "none" {
+		t.Fatalf("Visualizer = %q, want none", cfg.Visualizer)
+	}
 }
 
+// Mock player for ApplyPlayer tests
+type mockPlayer struct {
+	volumeMin float64
+	volume    float64
+	speed     float64
+	eq        [10]float64
+	mono      bool
+}
+
+func (m *mockPlayer) SetVolumeMin(db float64)        { m.volumeMin = db }
 func (m *mockPlayer) SetVolume(db float64)           { m.volume = db }
 func (m *mockPlayer) SetSpeed(ratio float64)         { m.speed = ratio }
 func (m *mockPlayer) SetEQBand(band int, dB float64) { m.eq[band] = dB }
@@ -575,6 +642,7 @@ func (m *mockPlayer) ToggleMono()                    { m.mono = !m.mono }
 
 func TestApplyPlayer(t *testing.T) {
 	cfg := defaultConfig()
+	cfg.VolumeMin = -70
 	cfg.Volume = -10
 	cfg.Speed = 1.5
 	cfg.EQ = [10]float64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
@@ -584,6 +652,9 @@ func TestApplyPlayer(t *testing.T) {
 	p := &mockPlayer{}
 	cfg.ApplyPlayer(p)
 
+	if p.volumeMin != -70 {
+		t.Errorf("volumeMin = %f, want -70", p.volumeMin)
+	}
 	if p.volume != -10 {
 		t.Errorf("volume = %f, want -10", p.volume)
 	}

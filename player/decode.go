@@ -30,6 +30,7 @@ var SupportedExts = map[string]bool{
 	".ogg":  true,
 	".m4a":  true,
 	".aac":  true,
+	".aacp": true,
 	".m4b":  true,
 	".alac": true,
 	".wma":  true,
@@ -226,11 +227,15 @@ func formatExt(path string) string {
 // needsFFmpeg reports whether the given extension requires ffmpeg to decode.
 func needsFFmpeg(ext string) bool {
 	switch ext {
-	case ".m4a", ".aac", ".m4b", ".alac", ".wma", ".opus", ".webm":
+	case ".m4a", ".aac", ".aacp", ".m4b", ".alac", ".wma", ".opus", ".webm":
 		return true
 	}
 	return false
 }
+
+// isHLS reports whether the extension denotes an HLS playlist that ffmpeg must
+// open by URL (so it can fetch and demux the segments itself).
+func isHLS(ext string) bool { return ext == ".m3u8" }
 
 // isBufferedURL reports whether the given URL requires the buffered download
 // + ffmpeg pipeline. Returns true if a registered matcher matches the URL.

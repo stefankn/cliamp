@@ -34,6 +34,13 @@ func (m *Model) handleNavBrowserKey(msg tea.KeyPressMsg) tea.Cmd {
 		if m.navBrowser.searching {
 			return m.handleNavSearchKey(msg)
 		}
+
+		if key == "ctrl+x" {
+			m.toggleExpandedView()
+			m.navMaybeAdjustScroll()
+			return nil
+		}
+
 		if key == "/" {
 			// Toggle: if already filtered, clear; otherwise open.
 			if m.navBrowser.search != "" {
@@ -61,6 +68,9 @@ func (m *Model) handleNavBrowserKey(msg tea.KeyPressMsg) tea.Cmd {
 func (m *Model) handleNavMenuKey(msg tea.KeyPressMsg) tea.Cmd {
 	const menuItems = 3
 	switch msg.String() {
+	case "ctrl+x":
+		m.toggleExpandedView()
+		return nil
 	case "ctrl+c":
 		m.navBrowser.visible = false
 		return m.quit()
@@ -315,7 +325,7 @@ func (m *Model) handleNavTrackListKey(msg tea.KeyPressMsg) tea.Cmd {
 
 	switch msg.String() {
 	case "ctrl+h":
-		m.showAlbumHeaders = !m.showAlbumHeaders
+		m.toggleAlbumHeadersManual()
 		m.navMaybeAdjustScroll()
 		return nil
 	case "ctrl+c":
@@ -362,6 +372,7 @@ func (m *Model) handleNavTrackListKey(msg tea.KeyPressMsg) tea.Cmd {
 			}
 
 			m.playlist.Add(toAdd...)
+			m.addToHeaderState(toAdd)
 			newIdx := m.playlist.Len() - len(toAdd)
 			m.playlist.SetIndex(newIdx)
 			m.plCursor = newIdx
@@ -390,7 +401,7 @@ func (m *Model) handleNavTrackListKey(msg tea.KeyPressMsg) tea.Cmd {
 			m.player.ClearPreload()
 			m.resetYTDLBatch()
 			m.playlist.Replace(tracks)
-			m.setInitialHeaderState(tracks)
+			m.setHeaderStateFromTracks(tracks)
 			m.plCursor = 0
 			m.plScroll = 0
 			m.playlist.SetIndex(0)
@@ -413,6 +424,7 @@ func (m *Model) handleNavTrackListKey(msg tea.KeyPressMsg) tea.Cmd {
 		if len(tracks) > 0 {
 			wasEmpty := m.playlist.Len() == 0
 			m.playlist.Add(tracks...)
+			m.addToHeaderState(tracks)
 			m.status.Showf(statusTTLMedium, "Added %d tracks", len(tracks))
 			if wasEmpty || !m.player.IsPlaying() {
 				m.playlist.SetIndex(0)
@@ -433,6 +445,7 @@ func (m *Model) handleNavTrackListKey(msg tea.KeyPressMsg) tea.Cmd {
 		if rawIdx < len(m.navBrowser.tracks) {
 			t := m.navBrowser.tracks[rawIdx]
 			m.playlist.Add(t)
+			m.addToHeaderState([]playlist.Track{t})
 			newIdx := m.playlist.Len() - 1
 			m.playlist.Queue(newIdx)
 			m.status.Showf(statusTTLMedium, "Queued: %s", t.DisplayName())
@@ -501,7 +514,7 @@ func navNextSort(s string, types []provider.SortType) string {
 
 // navMaybeAdjustScroll keeps navCursor visible within the rendered list window.
 func (m *Model) navMaybeAdjustScroll() {
-	visible := max(m.plVisible, 5)
+	visible := m.navVisible()
 	if m.navBrowser.cursor < m.navBrowser.scroll {
 		m.navBrowser.scroll = m.navBrowser.cursor
 	}

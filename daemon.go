@@ -9,11 +9,14 @@ import (
 	"syscall"
 	"time"
 
+	tea "charm.land/bubbletea/v2"
+
 	"cliamp/applog"
 	"cliamp/external/local"
 	"cliamp/internal/playback"
 	"cliamp/internal/resume"
 	"cliamp/ipc"
+	"cliamp/mediactl"
 	"cliamp/player"
 	"cliamp/playlist"
 	"cliamp/ui/model"
@@ -29,6 +32,19 @@ func runDaemon(p *player.Player, pl *playlist.Playlist, localProv *local.Provide
 		player:    p,
 		playlist:  pl,
 		localProv: localProv,
+		quit:      make(chan struct{}, 1),
+	}
+
+	// Wire MPRIS (Linux) / NowPlaying (macOS) so playerctl and OS media
+	// keys see the daemon. mediactl callbacks dispatch back through d.Send.
+	svc, mcErr := mediactl.New(func(msg tea.Msg) { d.Send(msg) })
+	if mcErr != nil {
+		fmt.Fprintf(os.Stderr, "media controls: %v\n", mcErr)
+		applog.Warn("daemon: media controls unavailable: %v", mcErr)
+	}
+	if svc != nil {
+		defer svc.Close()
+		d.notifier = svc
 	}
 
 	if autoPlay && pl.Len() > 0 {
@@ -55,6 +71,10 @@ func runDaemon(p *player.Player, pl *playlist.Playlist, localProv *local.Provide
 			applog.Info("daemon: signal received, shutting down")
 			d.saveResume()
 			return nil
+		case <-d.quit:
+			applog.Info("daemon: quit requested via media control, shutting down")
+			d.saveResume()
+			return nil
 		case <-ticker.C:
 			d.tick()
 		}
@@ -69,6 +89,8 @@ type daemon struct {
 	player    *player.Player
 	playlist  *playlist.Playlist
 	localProv *local.Provider
+	notifier  playback.Notifier
+	quit      chan struct{}
 }
 
 func (d *daemon) Send(msg any) {
@@ -76,14 +98,14 @@ func (d *daemon) Send(msg any) {
 	defer d.mu.Unlock()
 
 	switch m := msg.(type) {
-	case ipc.PlayMsg:
+	case ipc.PlayMsg, playback.PlayMsg:
 		if d.player.IsPaused() {
 			d.player.TogglePause()
 		} else if !d.player.IsPlaying() && d.playlist.Len() > 0 {
 			d.playCurrent()
 		}
 
-	case ipc.PauseMsg:
+	case ipc.PauseMsg, playback.PauseMsg:
 		if d.player.IsPlaying() && !d.player.IsPaused() {
 			d.player.TogglePause()
 		}
@@ -100,11 +122,27 @@ func (d *daemon) Send(msg any) {
 	case playback.PrevMsg:
 		d.prevTrack()
 
+	case playback.QuitMsg:
+		select {
+		case d.quit <- struct{}{}:
+		default:
+		}
+
 	case ipc.VolumeMsg:
 		d.player.SetVolume(m.DB)
 
+	case playback.SetVolumeMsg:
+		d.player.SetVolume(m.VolumeDB)
+
 	case ipc.SeekMsg:
 		_ = d.player.Seek(m.Offset)
+
+	case playback.SeekMsg:
+		_ = d.player.Seek(m.Offset)
+
+	case playback.SetPositionMsg:
+		cur := d.player.Position()
+		_ = d.player.Seek(m.Position - cur)
 
 	case ipc.LoadMsg:
 		d.handleLoad(m)
@@ -142,16 +180,48 @@ func (d *daemon) Send(msg any) {
 	}
 }
 
-// tick advances to the next track when the current one has drained.
-// Daemon mode skips gapless preloading; small inter-track gaps are fine.
+// tick advances to the next track when the current one has drained, and
+// republishes playback state to the media-control notifier. Daemon mode
+// skips gapless preloading; small inter-track gaps are fine.
 func (d *daemon) tick() {
 	d.mu.Lock()
-	if !d.player.IsPlaying() || d.player.IsPaused() || !d.player.Drained() {
-		d.mu.Unlock()
-		return
+	if d.player.IsPlaying() && !d.player.IsPaused() && d.player.Drained() {
+		d.nextTrack()
 	}
-	d.nextTrack()
+	state := d.snapshotState()
 	d.mu.Unlock()
+	if d.notifier != nil {
+		d.notifier.Update(state)
+	}
+}
+
+// snapshotState builds a playback.State for OS media-control notifiers.
+// Caller must hold d.mu.
+func (d *daemon) snapshotState() playback.State {
+	status := playback.StatusStopped
+	if d.player.IsPlaying() {
+		if d.player.IsPaused() {
+			status = playback.StatusPaused
+		} else {
+			status = playback.StatusPlaying
+		}
+	}
+	track, _ := d.playlist.Current()
+	return playback.State{
+		Status: status,
+		Track: playback.Track{
+			Title:       track.Title,
+			Artist:      track.Artist,
+			Album:       track.Album,
+			Genre:       track.Genre,
+			TrackNumber: track.TrackNumber,
+			URL:         track.Path,
+			Duration:    d.player.Duration(),
+		},
+		VolumeDB: d.player.Volume(),
+		Position: d.player.Position(),
+		Seekable: d.player.Seekable(),
+	}
 }
 
 func (d *daemon) playCurrent() {

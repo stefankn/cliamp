@@ -21,6 +21,7 @@ type searchState struct {
 	query   string
 	results []int // indices into playlist tracks
 	cursor  int
+	scroll  int
 }
 
 // netSearchScreenType identifies which screen of the net search overlay is active.
@@ -40,6 +41,7 @@ type netSearchState struct {
 	loading    bool
 	results    []playlist.Track
 	cursor     int
+	scroll     int
 	err        string
 }
 
@@ -49,6 +51,7 @@ type provSearchState struct {
 	query   string
 	results []int // indices into providerLists
 	cursor  int
+	scroll  int
 }
 
 // seekState holds debounce state for yt-dlp seek-by-restart.
@@ -67,6 +70,15 @@ type themePickerState struct {
 	cursor   int
 	scroll   int
 	savedIdx int // themeIdx before opening picker, for cancel/restore
+}
+
+// visPickerState holds state for the visualizer picker overlay.
+type visPickerState struct {
+	visible   bool
+	cursor    int
+	scroll    int
+	savedMode int      // vis.Mode before opening, for cancel/restore
+	modes     []string // mode names captured at open (stable while open)
 }
 
 // lyricsState holds state for the lyrics display overlay.
@@ -96,19 +108,22 @@ type keymapOverlay struct {
 type queueOverlay struct {
 	visible bool
 	cursor  int
+	scroll  int
 }
 
 // plManagerState holds state for the playlist manager overlay.
 type plManagerState struct {
-	visible     bool
-	screen      plMgrScreenType
-	cursor      int // view-index: offset into filtered when filter != "", else direct index
-	scroll      int
-	playlists   []playlist.PlaylistInfo
-	selPlaylist string           // playlist name open in screen 1
-	tracks      []playlist.Track // tracks in the selected playlist
-	newName     string
-	confirmDel  bool
+	visible       bool
+	screen        plMgrScreenType
+	cursor        int // view-index: offset into filtered when filter != "", else direct index
+	scroll        int
+	playlists     []playlist.PlaylistInfo
+	selPlaylist   string           // playlist name open in screen 1
+	tracks        []playlist.Track // tracks in the selected playlist
+	newName       string
+	confirmDel    bool
+	renameOldName string
+	renameName    string
 
 	// Filter (`/`) state. Reset on screen change. `filtered` indexes into
 	// `playlists` (list screen) or `tracks` (tracks screen).
@@ -175,6 +190,7 @@ type spotSearchState struct {
 	query     string
 	results   []playlist.Track
 	cursor    int
+	scroll    int
 	loading   bool
 	playlists []playlist.PlaylistInfo // user's Spotify playlists for picker
 	selTrack  playlist.Track          // track selected to add
@@ -209,6 +225,7 @@ type devicePickerState struct {
 	visible bool
 	devices []player.AudioDevice
 	cursor  int
+	scroll  int
 	loading bool
 }
 

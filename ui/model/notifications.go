@@ -26,7 +26,7 @@ func (m *Model) notifyPlugins() {
 	if m.luaMgr == nil || !m.luaMgr.HasHooks() {
 		return
 	}
-	track, _ := m.playlist.Current()
+	track, _ := m.currentPlaybackTrack()
 	artist, title := m.resolveTrackDisplay(track)
 	status := "stopped"
 	if m.player.IsPlaying() {
@@ -84,7 +84,7 @@ func (m *Model) notifyPlayback() {
 			status = playback.StatusPlaying
 		}
 	}
-	track, _ := m.playlist.Current()
+	track, _ := m.currentPlaybackTrack()
 	artist, title := m.resolveTrackDisplay(track)
 	m.notifier.Update(playback.State{
 		Status: status,
