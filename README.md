@@ -1,17 +1,23 @@
-A retro terminal music player inspired by Winamp. Play local files, streams, podcasts, YouTube, YouTube Music, SoundCloud, Bilibili, Spotify, NetEase Cloud Music, Xiaoyuzhou (小宇宙), Navidrome, Plex, and Jellyfin with a spectrum visualizer, parametric EQ, and playlist management.
+[![Docs on contextowl.co](https://contextowl.co/uploads/_brand/badge-docs.svg)](https://contextowl.co)
 
-**[cliamp.stream](https://cliamp.stream)**
+A retro terminal music player inspired by Winamp. Play local files, streams, podcasts, YouTube, YouTube Music, SoundCloud, Mixcloud, Bilibili, Spotify, Qobuz, Tidal, NetEase Cloud Music, Yandex Music, Xiaoyuzhou (小宇宙), Navidrome, Lyrion, Plex, Jellyfin, Emby, and Audiobookshelf. Use the spectrum visualizer, parametric EQ, and playlist manager.
 
-Built with [Bubbletea](https://github.com/charmbracelet/bubbletea), [Lip Gloss](https://github.com/charmbracelet/lipgloss), [Beep](https://github.com/gopxl/beep), and [go-librespot](https://github.com/devgianlu/go-librespot).
+**[cliamp.stream](https://cliamp.stream)** | **[docs](https://whiterose.org.contextowl.co/docs/cliamp)** | **[android](https://github.com/cliamp/cliamp-mobile)** | **[discord](https://discord.gg/4VpCzXPuj2)**
 
+On a phone, run [cliamp mobile](https://github.com/cliamp/cliamp-mobile). It is a native Android client for radio, podcasts, and the same servers this player talks to.
 
-https://github.com/user-attachments/assets/fbc33d20-e3ac-4a62-a991-8a2f0243c8ea
+cliamp uses [Bubbletea](https://github.com/charmbracelet/bubbletea), [Lip Gloss](https://github.com/charmbracelet/lipgloss), [Beep](https://github.com/gopxl/beep), and [go-librespot](https://github.com/devgianlu/go-librespot).
 
+https://github.com/user-attachments/assets/55e251f2-e13b-43d9-bb6a-7b1960e7d7d0
+
+<div align="center">
+  <a href="https://contextowl.co"><img src="https://contextowl.co/uploads/_brand/sponsor-dark.svg" alt="Proudly sponsored by contextowl.co" width="400"></a>
+</div>
 
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/bjarneo/cliamp/HEAD/install.sh | sh
+curl -fsSL https://cliamp.stream/install.sh | sh
 ```
 
 **Homebrew**
@@ -20,7 +26,7 @@ curl -fsSL https://raw.githubusercontent.com/bjarneo/cliamp/HEAD/install.sh | sh
 brew install bjarneo/cliamp/cliamp
 ```
 
-The formula pulls in all required runtime libraries automatically.
+The formula installs all required runtime libraries.
 
 **Arch Linux (AUR)**
 
@@ -28,37 +34,62 @@ The formula pulls in all required runtime libraries automatically.
 yay -S cliamp
 ```
 
+**Nix**
+
+```sh
+nix run github:bjarneo/cliamp
+```
+
+For a declarative NixOS configuration, add `github:bjarneo/cliamp` as a flake
+input. Install its default package:
+
+```nix
+inputs.cliamp.url = "github:bjarneo/cliamp";
+
+environment.systemPackages = [
+  inputs.cliamp.packages.${pkgs.stdenv.hostPlatform.system}.default
+];
+```
+
+**Go**
+
+```sh
+go install github.com/bjarneo/cliamp@latest
+```
+
+Install ALSA development headers before you build on Linux. See [Building from source](#building-from-source).
+
 **Pre-built binaries**
 
 Download from [GitHub Releases](https://github.com/bjarneo/cliamp/releases/latest).
 
-> **macOS:** the pre-built binaries dynamically link against FLAC, Vorbis, and Ogg
-> from Homebrew. If you download directly from Releases (or use the `install.sh`
-> script) you must install them first, otherwise you will see errors like
+> **macOS:** Pre-built binaries link dynamically to FLAC, Vorbis, Ogg, and mpg123
+> from Homebrew. If you download from Releases or use `install.sh`, install these
+> libraries first. Otherwise, you can see errors such as
 > `Library not loaded: /opt/homebrew/opt/libvorbis/lib/libvorbisenc.2.dylib`:
 >
 > ```sh
-> brew install flac libvorbis libogg
+> brew install flac libvorbis libogg mpg123
 > ```
 >
-> Installing via `brew install bjarneo/cliamp/cliamp` does this for you.
+> `brew install bjarneo/cliamp/cliamp` installs these libraries.
 >
-> **Linux:** the pre-built binaries statically link FLAC, Vorbis, and Ogg, so no
-> extra codec packages are required. You may still need an ALSA bridge for your
-> sound server — see [Troubleshooting](#troubleshooting).
+> **Linux:** Pre-built binaries link FLAC, Vorbis, Ogg, and mpg123 statically. No
+> extra codec packages are required. You can still need an ALSA bridge for your
+> sound server. See [Troubleshooting](#troubleshooting).
 >
-> **Windows:** download `cliamp-windows-amd64.exe` from Releases. If `HOME` is not
-> set, cliamp stores its config under `%APPDATA%\cliamp`. The Spotify provider is
-> currently unavailable on Windows builds.
+> **Windows:** Download and extract `cliamp-windows-amd64.zip` from Releases. It
+> includes the codec DLLs that Spotify requires. If `HOME` is not set, cliamp stores
+> its config under `%APPDATA%\cliamp`.
 
-**Optional runtime dependencies** (all platforms, all install methods):
+**Optional runtime dependencies** for all platforms and install methods:
 
-- [ffmpeg](https://ffmpeg.org/) — for AAC, ALAC, Opus, and WMA playback
-- [yt-dlp](https://github.com/yt-dlp/yt-dlp) — for YouTube, YouTube Music, SoundCloud, Bandcamp, Bilibili, and NetEase Cloud Music
+- [ffmpeg](https://ffmpeg.org/) for AAC, ALAC, Opus, and WMA playback
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) for YouTube, YouTube Music, SoundCloud, Mixcloud, Bandcamp, Bilibili, and NetEase Cloud Music
 
-On macOS: `brew install ffmpeg yt-dlp`. On Linux, use your distribution's package manager.
+On macOS, run `brew install ffmpeg yt-dlp`. On Linux, use your distribution package manager.
 
-On Windows, install `ffmpeg` and `yt-dlp` with your preferred package manager and keep both on `PATH`.
+On Windows, install `ffmpeg` and `yt-dlp` with your package manager. Keep both on `PATH`.
 
 **Build from source**
 
@@ -76,50 +107,130 @@ cliamp https://example.com/stream  # play a URL
 
 Press `Ctrl+K` to see all keybindings.
 
-**Configure remote providers** (Navidrome, Plex, Jellyfin, Spotify, YouTube Music, NetEase Cloud Music) with the interactive wizard:
+**Configure remote providers** such as Navidrome, Lyrion, Plex, Jellyfin, Emby, Audiobookshelf, Spotify, Qobuz, Tidal, Mixcloud, YouTube Music, and NetEase Cloud Music with the interactive wizard:
 
 ```sh
 cliamp setup
 ```
 
-It walks you through each provider, validates the connection, and writes the right block to your config file (`~/.config/cliamp/config.toml`, or `%APPDATA%\cliamp\config.toml` on Windows when `HOME` is unset). See [docs/cli.md](docs/cli.md#setup-wizard) for details.
+The wizard guides you through each provider. It writes the provider keys into the section of that provider in your config file (`~/.config/cliamp/config.toml`, or `%APPDATA%\cliamp\config.toml` on Windows when `HOME` is unset). It keeps your other keys and comments. It validates supported server connections during setup. The OAuth providers Spotify, Qobuz and Tidal sign in later in the player. Mixcloud checks optional browser-session or OAuth credentials when you use them. See [docs/cli.md](docs/cli.md#setup-wizard) for details.
+
+See the [Mixcloud provider guide](docs/mixcloud.md) for discovery, account,
+creator/show, genre search, local genre favorites, authentication, signed-in
+playback, resume, seeking, and limitations.
+
+For podcast discovery and subscriptions, run `cliamp --provider podcast`.
+Browse Apple's top 100 shows and 19 categories, search with `/` then `Enter`,
+and subscribe with `f`. No account or API key is needed.
+See the [Podcasts guide](docs/podcasts.md).
+
+## Remote Control
+
+Control a running cliamp from a script, a status bar, or a key binding:
+
+```sh
+cliamp toggle
+cliamp next
+cliamp status --json
+```
+
+Media keys work through MPRIS on Linux, Now Playing on macOS, and global
+hotkeys on Windows.
+
+Run `cliamp --daemon` to play without a TUI. Headless mode runs the same
+player as the TUI. It loads your Lua plugins, reports plays to Navidrome,
+Jellyfin, and the other providers that take play reports, and adds each track
+to Recently Played when the track starts. See
+[docs/headless.md](docs/headless.md) and
+[docs/remote-control.md](docs/remote-control.md).
 
 ## Radio
 
-Press `R` in the player to browse and search 30,000+ online radio stations from the [Radio Browser](https://www.radio-browser.info/) directory.
+Press `R` in the player to browse about 58,000 online radio stations in the [Radio Browser](https://www.radio-browser.info/) directory.
+
+Cut that down by location or genre: `N` browses by country, **Browse genres &
+tags** opens the directory's complete tag index, and `/` filters either list.
+`f` pins the countries you listen to, and `Enter` on a country or tag loads its
+stations as a playlist. cliamp does not work out where you are unless you pick
+"Use my location" and accept; it then reads your country from the system
+timezone, never from a geo-IP service. See [docs/radio.md](docs/radio.md).
 
 Add your own stations to `~/.config/cliamp/radios.toml` (or `%APPDATA%\cliamp\radios.toml` on Windows when `HOME` is unset). See [docs/configuration.md](docs/configuration.md#custom-radio-stations).
 
-Want to host your own radio? Check out [cliamp-server](https://github.com/bjarneo/cliamp-server).
+To host a radio station, use [cliamp-server](https://github.com/bjarneo/cliamp-server).
 
 ## Building from source
 
 **Prerequisites:**
 
-- [Go](https://go.dev/dl/) 1.25.5 or later
-- ALSA development headers (Linux only — required by the audio backend)
+- [Go](https://go.dev/dl/) 1.26.6 or later
+- ALSA development headers (Linux only, required by the audio backend)
 
 **Linux (Debian/Ubuntu):**
 
 ```sh
-sudo apt install libasound2-dev
+sudo apt install libasound2-dev libflac-dev libvorbis-dev libogg-dev libmpg123-dev
 ```
 
 **Linux (Fedora):**
 
 ```sh
-sudo dnf install alsa-lib-devel libvorbis-devel flac-devel
+sudo dnf install alsa-lib-devel flac-devel libvorbis-devel libogg-devel mpg123-devel
 ```
 
 **Linux (Arch):**
 
 ```sh
-sudo pacman -S alsa-lib
+sudo pacman -S alsa-lib flac libvorbis libogg mpg123
 ```
 
-**macOS:** No extra dependencies — CoreAudio is used.
+**macOS:**
 
-**Windows:** No extra SDKs required for the core player. `ffmpeg.exe` and `yt-dlp.exe` remain optional runtime dependencies for the same formats/providers as on other platforms. Spotify is not available on Windows builds.
+```sh
+brew install flac libvorbis libogg mpg123 pkg-config
+```
+
+**Windows:** The core player needs no extra SDKs. It uses pure-Go audio decoding. `ffmpeg.exe` and `yt-dlp.exe` remain optional runtime dependencies for the same formats and providers as other platforms.
+
+Spotify support uses `go-librespot`. It needs CGO and a MinGW toolchain:
+
+1. Install [MSYS2](https://www.msys2.org/).
+2. Open the **MSYS2 MinGW64** terminal, not the standard MSYS2 terminal. Install the toolchain and codec libraries:
+
+   ```sh
+   pacman -S make \
+     mingw-w64-x86_64-gcc mingw-w64-x86_64-go mingw-w64-x86_64-pkg-config \
+     mingw-w64-x86_64-libogg mingw-w64-x86_64-libvorbis \
+     mingw-w64-x86_64-flac mingw-w64-x86_64-mpg123
+   ```
+
+   To check if Go was installed correctly, run
+
+   ```sh
+   go env GOROOT
+   ```
+
+   If the command causes the error `go: cannot find GOROOT directory: 'go' binary is trimmed and GOROOT is not set`,
+   it means that the enviroment `GOROOT` variable has to be manually set:
+
+   ```sh
+   export GOROOT=/mingw64/lib/go
+   ```
+
+   Now, when running `go env GOROOT`, the output should be: `<mtsys2-install-folder>/mingw64/lib/go`
+3. In that MinGW64 terminal, build with CGO enabled. This keeps `gcc` and `pkg-config` on `PATH`:
+
+   ```sh
+   CGO_ENABLED=1 go build -o cliamp.exe .
+   ```
+
+   Some MSYS2 `libogg` builds provide `libogg-0.dll` without `ogg_stream_iovecin` in its export table. The static `libogg.a` has this symbol. If linking fails with `undefined reference to 'ogg_stream_iovecin'`, use static linking for this library only:
+
+   ```sh
+   CGO_LDFLAGS="-Wl,-Bstatic -logg -Wl,-Bdynamic" CGO_ENABLED=1 go build -o cliamp.exe .
+   ```
+
+4. `cliamp.exe` links dynamically to codec and MinGW runtime DLLs. Keep `C:\msys64\mingw64\bin` on `PATH` at runtime, or copy each `/mingw64/bin/*.dll` that `ldd cliamp.exe` shows next to `cliamp.exe`.
 
 **Clone and build:**
 
@@ -133,48 +244,24 @@ Or without Make: `go build -o cliamp .`
 
 `make install` places the binary in `~/.local/bin/`.
 
-**Optional runtime dependencies:**
-
-- [ffmpeg](https://ffmpeg.org/) — for AAC, ALAC, Opus, and WMA playback
-- [yt-dlp](https://github.com/yt-dlp/yt-dlp) — for YouTube, SoundCloud, Bandcamp, Bilibili, and NetEase Cloud Music
+A source build uses the same optional runtime dependencies as the other install methods. See [Install](#install).
 
 ## Docs
 
-- [Configuration](docs/configuration.md)
-- [Keybindings](docs/keybindings.md)
-- [CLI Flags](docs/cli.md)
-- [Streaming](docs/streaming.md)
-- [Playlists](docs/playlists.md)
-- [YouTube, SoundCloud, Bandcamp and Bilibili](docs/yt-dlp.md)
-- [YouTube Music](docs/youtube-music.md)
-- [NetEase Cloud Music](docs/netease.md)
-- [SoundCloud](docs/soundcloud.md)
-- [Lyrics](docs/lyrics.md)
-- [Spotify](docs/spotify.md)
-- [Navidrome](docs/navidrome.md)
-- [Plex](docs/plex.md)
-- [Jellyfin](docs/jellyfin.md)
-- [Themes](docs/themes.md)
-- [SSH Streaming](docs/ssh-streaming.md)
-- [Remote Control (IPC)](docs/remote-control.md)
-- [Headless Daemon Mode](docs/headless.md)
-- [Audio Quality](docs/audio-quality.md)
-- [Media Controls](docs/mediactl.md)
-- [Quickshell Now-Playing Widget (Omarchy)](docs/quickshell.md)
-- [Lua Plugins](docs/plugins.md)
-  - [Community Plugins](docs/community-plugins.md)
-  - [Soap Bubbles Visualizer](https://github.com/bjarneo/cliamp-plugin-soap-bubbles)
+Full documentation is hosted at **[whiterose.org.contextowl.co/docs/cliamp](https://whiterose.org.contextowl.co/docs/cliamp)**.
 
 ## Troubleshooting
 
-**No audio output (silence with no errors)**
+**No audio output**
 
-On Linux systems using PipeWire or PulseAudio, cliamp's ALSA backend needs a bridge package to route audio through your sound server:
+cliamp reports `audio output unavailable` when it cannot open an output
+device. On Linux systems that use PipeWire or PulseAudio, the cliamp ALSA
+backend needs a bridge package to route audio through the sound server:
 
 - **PipeWire:** `pipewire-alsa`
-- **PulseAudio:** `pulseaudio-alsa`
+- **PulseAudio:** `pulseaudio-alsa` (`libasound2-plugins` on Debian/Ubuntu)
 
-Install the appropriate package for your system:
+Install the package for your system:
 
 ```sh
 # PipeWire (Arch)
@@ -185,7 +272,13 @@ sudo pacman -S pulseaudio-alsa
 
 # Debian/Ubuntu (PipeWire)
 sudo apt install pipewire-alsa
+
+# Debian/Ubuntu (PulseAudio, including WSL2)
+sudo apt install libasound2-plugins
 ```
+
+On WSL2 see [WSL2 setup](docs/configuration.md#wsl2-windows-subsystem-for-linux)
+for the extra ALSA routing step.
 
 ## Author
 
@@ -193,4 +286,4 @@ sudo apt install pipewire-alsa
 
 ## Disclaimer
 
-Use this software at your own risk. We are not responsible for any damages or issues that may arise from using this software.
+Use this software at your own risk. The authors are not responsible for damage or issues that result from its use.

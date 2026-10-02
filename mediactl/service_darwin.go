@@ -125,7 +125,7 @@ static void bridgeDestroy(MediaCtlBridgeRef ref) {
 }
 
 // playbackState: 0 = stopped, 1 = playing, 2 = paused
-static void updateNowPlaying(const char *title, const char *artist, const char *album,
+static void updateNowPlaying(const char *title, const char *artist, const char *album, const char *artURL,
                               double durationSecs, double elapsedSecs, int playbackState, int canSeek) {
 	@autoreleasepool {
 		MPRemoteCommandCenter *cc = [MPRemoteCommandCenter sharedCommandCenter];
@@ -141,6 +141,19 @@ static void updateNowPlaying(const char *title, const char *artist, const char *
 		if (title)  info[MPMediaItemPropertyTitle] = @(title);
 		if (artist) info[MPMediaItemPropertyArtist] = @(artist);
 		if (album)  info[MPMediaItemPropertyAlbumTitle] = @(album);
+		if (artURL) {
+			// cliamp only passes local file:// artwork URLs here. Avoid extending
+			// this path to remote artwork without moving image loading off-thread.
+			NSURL *url = [NSURL URLWithString:@(artURL)];
+			NSImage *image = url ? [[[NSImage alloc] initWithContentsOfURL:url] autorelease] : nil;
+			if (image) {
+				MPMediaItemArtwork *artwork = [[[MPMediaItemArtwork alloc] initWithBoundsSize:image.size
+					requestHandler:^NSImage * _Nonnull(CGSize size) {
+						return image;
+					}] autorelease];
+				info[MPMediaItemPropertyArtwork] = artwork;
+			}
+		}
 		if (durationSecs > 0) info[MPMediaItemPropertyPlaybackDuration] = @(durationSecs);
 		if (elapsedSecs >= 0) info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = @(elapsedSecs);
 		info[MPNowPlayingInfoPropertyPlaybackRate] = @(playbackState == 1 ? 1.0 : 0.0);
@@ -168,7 +181,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
-	"cliamp/internal/playback"
+	"github.com/bjarneo/cliamp/internal/playback"
 )
 
 func Run(prog *tea.Program, svc *Service) (tea.Model, error) {
@@ -198,6 +211,7 @@ func Run(prog *tea.Program, svc *Service) (tea.Model, error) {
 
 type updateReq struct {
 	title, artist, album      string
+	artURL                    string
 	durationSecs, elapsedSecs float64
 	status                    playback.Status
 	canSeek                   bool
@@ -486,7 +500,7 @@ func (s *Service) beginRelease(allowRunLoop bool) (cgo.Handle, C.MediaCtlBridgeR
 }
 
 func applyUpdate(req updateReq) {
-	var cTitle, cArtist, cAlbum *C.char
+	var cTitle, cArtist, cAlbum, cArtURL *C.char
 	if req.title != "" {
 		cTitle = C.CString(req.title)
 		defer C.free(unsafe.Pointer(cTitle))
@@ -499,11 +513,15 @@ func applyUpdate(req updateReq) {
 		cAlbum = C.CString(req.album)
 		defer C.free(unsafe.Pointer(cAlbum))
 	}
+	if req.artURL != "" {
+		cArtURL = C.CString(req.artURL)
+		defer C.free(unsafe.Pointer(cArtURL))
+	}
 	canSeek := C.int(0)
 	if req.canSeek {
 		canSeek = 1
 	}
-	C.updateNowPlaying(cTitle, cArtist, cAlbum,
+	C.updateNowPlaying(cTitle, cArtist, cAlbum, cArtURL,
 		C.double(req.durationSecs), C.double(req.elapsedSecs), nowPlayingState(req.status), canSeek)
 }
 
@@ -526,6 +544,7 @@ func (s *Service) Update(state playback.State) {
 		title:        state.Track.Title,
 		artist:       state.Track.Artist,
 		album:        state.Track.Album,
+		artURL:       state.Track.ArtURL,
 		durationSecs: state.Track.Duration.Seconds(),
 		elapsedSecs:  state.Position.Seconds(),
 		status:       state.Status,

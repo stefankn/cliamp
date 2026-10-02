@@ -1,10 +1,16 @@
 package plex
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/bjarneo/cliamp/internal/httpclient"
 )
 
 // newTestClient returns a Client pointed at the given test server.
@@ -210,19 +216,22 @@ func TestAlbums_RequestsType9(t *testing.T) {
 }
 
 func TestAlbums_Paginates(t *testing.T) {
-	callCount := 0
+	seenStarts := map[string]bool{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount++
 		start := r.URL.Query().Get("X-Plex-Container-Start")
+		seenStarts[start] = true
 		w.Header().Set("Content-Type", "application/json")
 		switch start {
 		case "0", "":
-			w.Write([]byte(`{"MediaContainer":{"totalSize":2,"Metadata":[{"ratingKey":"1","title":"A","parentTitle":"Art","year":2000,"leafCount":1}]}}`))
-		case "300":
-			// Second page — but totalSize=2 means we should never reach here with pageSize=300.
-			// This tests that we stop after the first page when totalSize <= pageSize.
-			t.Errorf("unexpected second page request (offset=%s)", start)
-			w.Write([]byte(`{"MediaContainer":{"totalSize":2,"Metadata":[]}}`))
+			// Two albums for a page of 300: the server returned fewer
+			// items than were asked for, which is the case that used to
+			// make the loop skip straight past the remainder.
+			w.Write([]byte(`{"MediaContainer":{"totalSize":3,"Metadata":[{"ratingKey":"1","title":"A","parentTitle":"Art","year":2000,"leafCount":1},{"ratingKey":"2","title":"B","parentTitle":"Art","year":2001,"leafCount":2}]}}`))
+		case "2":
+			w.Write([]byte(`{"MediaContainer":{"totalSize":3,"Metadata":[{"ratingKey":"3","title":"C","parentTitle":"Art","year":2002,"leafCount":3}]}}`))
+		default:
+			t.Errorf("unexpected start %q", start)
+			w.WriteHeader(http.StatusBadRequest)
 		}
 	}))
 	defer srv.Close()
@@ -231,11 +240,288 @@ func TestAlbums_Paginates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Albums() error: %v", err)
 	}
-	if len(albums) != 1 {
-		t.Errorf("expected 1 album, got %d", len(albums))
+	if len(albums) != 3 {
+		t.Fatalf("expected 3 albums, got %d", len(albums))
 	}
-	if callCount != 1 {
-		t.Errorf("expected 1 API call, got %d", callCount)
+	if albums[2].Title != "C" || albums[2].TrackCount != 3 {
+		t.Errorf("unexpected albums[2]: %+v", albums[2])
+	}
+	if !seenStarts["0"] || !seenStarts["2"] {
+		t.Errorf("expected pagination to hit starts 0 and 2, got %v", seenStarts)
+	}
+}
+
+func TestAlbums_PaginatesWithoutTotalSize(t *testing.T) {
+	var starts []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := r.URL.Query().Get("X-Plex-Container-Start")
+		starts = append(starts, start)
+		w.Header().Set("Content-Type", "application/json")
+		switch start {
+		case "0", "":
+			w.Write([]byte(`{"MediaContainer":{"Metadata":[{"ratingKey":"1","title":"A"}]}}`))
+		case "1":
+			w.Write([]byte(`{"MediaContainer":{"Metadata":[{"ratingKey":"2","title":"B"}]}}`))
+		case "2":
+			w.Write([]byte(`{"MediaContainer":{"Metadata":[]}}`))
+		default:
+			t.Errorf("unexpected start %q", start)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer srv.Close()
+
+	albums, err := newTestClient(srv).Albums("1")
+	if err != nil {
+		t.Fatalf("Albums() error: %v", err)
+	}
+	if len(albums) != 2 {
+		t.Fatalf("expected 2 albums, got %d", len(albums))
+	}
+	wantStarts := []string{"0", "1", "2"}
+	if !slices.Equal(starts, wantStarts) {
+		t.Fatalf("starts = %v, want %v", starts, wantStarts)
+	}
+}
+
+func TestAlbums_StopsWhenTotalSizeReached(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"MediaContainer":{"totalSize":1,"Metadata":[{"ratingKey":"1","title":"A"}]}}`))
+	}))
+	defer srv.Close()
+
+	albums, err := newTestClient(srv).Albums("1")
+	if err != nil {
+		t.Fatalf("Albums() error: %v", err)
+	}
+	if len(albums) != 1 {
+		t.Fatalf("expected 1 album, got %d", len(albums))
+	}
+	if calls != 1 {
+		t.Fatalf("expected 1 API call once totalSize was reached, got %d", calls)
+	}
+}
+
+func TestPlaylists_FiltersAudio(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/playlists") {
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{
+			"MediaContainer": {
+				"Metadata": [
+					{"ratingKey":"1","title":"GOOD","smart":true,"playlistType":"audio","leafCount":3,"duration":600000},
+					{"ratingKey":"2","title":"drums","smart":false,"playlistType":"audio","leafCount":28,"duration":6000000},
+					{"ratingKey":"3","title":"Home Movies","smart":false,"playlistType":"video","leafCount":4,"duration":12000000}
+				]
+			}
+		}`))
+	}))
+	defer srv.Close()
+
+	playlists, err := newTestClient(srv).Playlists()
+	if err != nil {
+		t.Fatalf("Playlists() error: %v", err)
+	}
+	if len(playlists) != 2 {
+		t.Fatalf("expected 2 audio playlists, got %d", len(playlists))
+	}
+	a := playlists[0]
+	if a.RatingKey != "1" || a.Title != "GOOD" || !a.Smart || a.TrackCount != 3 || a.DurationSecs != 600 {
+		t.Errorf("unexpected playlist[0]: %+v", a)
+	}
+	b := playlists[1]
+	if b.RatingKey != "2" || b.Title != "drums" || b.Smart || b.TrackCount != 28 || b.DurationSecs != 6000 {
+		t.Errorf("unexpected playlist[1]: %+v", b)
+	}
+}
+
+func TestPlaylistTracks_Paginates(t *testing.T) {
+	seenStarts := map[string]bool{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/playlists/42/items") {
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+		start := r.URL.Query().Get("X-Plex-Container-Start")
+		size := r.URL.Query().Get("X-Plex-Container-Size")
+		if size != "1000" {
+			t.Errorf("expected size=1000, got %q", size)
+		}
+		seenStarts[start] = true
+		w.Header().Set("Content-Type", "application/json")
+		switch start {
+		case "0", "":
+			w.Write([]byte(`{"MediaContainer":{"totalSize":3,"Metadata":[{"ratingKey":"1","title":"One","grandparentTitle":"A","parentTitle":"Al","index":1,"duration":1000,"Media":[{"Part":[{"key":"/library/parts/1/1/one.flac"}]}]},{"ratingKey":"2","title":"Two","grandparentTitle":"B","parentTitle":"Alb","index":2,"duration":2000,"Media":[{"Part":[{"key":"/library/parts/2/2/two.flac"}]}]}]}}`))
+		case "2":
+			w.Write([]byte(`{"MediaContainer":{"totalSize":3,"Metadata":[{"ratingKey":"3","title":"Three","grandparentTitle":"C","parentTitle":"Album","index":3,"duration":3000,"Media":[{"Part":[{"key":"/library/parts/3/3/three.flac"}]}]}]}}`))
+		default:
+			t.Errorf("unexpected start %q", start)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer srv.Close()
+
+	tracks, err := newTestClient(srv).PlaylistTracks("42")
+	if err != nil {
+		t.Fatalf("PlaylistTracks() error: %v", err)
+	}
+	if len(tracks) != 3 {
+		t.Fatalf("expected 3 tracks, got %d", len(tracks))
+	}
+	if tracks[0].Title != "One" || tracks[0].PartKey != "/library/parts/1/1/one.flac" {
+		t.Errorf("unexpected tracks[0]: %+v", tracks[0])
+	}
+	if tracks[1].Title != "Two" || tracks[1].ArtistName != "B" || tracks[1].Duration != 2000 {
+		t.Errorf("unexpected tracks[1]: %+v", tracks[1])
+	}
+	if tracks[2].Title != "Three" {
+		t.Errorf("unexpected tracks[2]: %+v", tracks[2])
+	}
+	if !seenStarts["0"] || !seenStarts["2"] {
+		t.Errorf("expected pagination to hit starts 0 and 2, got %v", seenStarts)
+	}
+}
+
+func TestPlaylistTracks_PaginatesWithoutTotalSize(t *testing.T) {
+	var starts []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := r.URL.Query().Get("X-Plex-Container-Start")
+		starts = append(starts, start)
+		w.Header().Set("Content-Type", "application/json")
+		switch start {
+		case "0", "":
+			w.Write([]byte(`{"MediaContainer":{"Metadata":[{"ratingKey":"1","title":"One"}]}}`))
+		case "1":
+			w.Write([]byte(`{"MediaContainer":{"Metadata":[{"ratingKey":"2","title":"Two"}]}}`))
+		case "2":
+			w.Write([]byte(`{"MediaContainer":{"Metadata":[]}}`))
+		default:
+			t.Errorf("unexpected start %q", start)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer srv.Close()
+
+	tracks, err := newTestClient(srv).PlaylistTracks("42")
+	if err != nil {
+		t.Fatalf("PlaylistTracks() error: %v", err)
+	}
+	if len(tracks) != 2 {
+		t.Fatalf("expected 2 tracks, got %d", len(tracks))
+	}
+	wantStarts := []string{"0", "1", "2"}
+	if !slices.Equal(starts, wantStarts) {
+		t.Fatalf("starts = %v, want %v", starts, wantStarts)
+	}
+}
+
+// TestPagingStopsWhenServerIgnoresStart covers a server or proxy that drops
+// X-Plex-Container-Start. Each page then repeats the first one, and without
+// a totalSize no page ends the loop.
+func TestPagingStopsWhenServerIgnoresStart(t *testing.T) {
+	albums := func(c *Client) (int, error) {
+		got, err := c.Albums("7")
+		return len(got), err
+	}
+	playlistTracks := func(c *Client) (int, error) {
+		got, err := c.PlaylistTracks("42")
+		return len(got), err
+	}
+	tests := []struct {
+		name      string
+		fetch     func(c *Client) (int, error)
+		page      func(start int) string // the Metadata items for a start
+		total     string                 // the totalSize key, or empty to omit it
+		wantItems int
+		wantErr   string
+		wantCalls int
+	}{
+		{
+			name:      "albums repeat the first page",
+			fetch:     albums,
+			page:      func(int) string { return `{"ratingKey":"1"},{"ratingKey":"2"}` },
+			wantErr:   "plex: section 7 albums: server ignored X-Plex-Container-Start 2",
+			wantCalls: 2,
+		},
+		{
+			name:      "albums repeat the first page with a totalSize",
+			fetch:     albums,
+			page:      func(int) string { return `{"ratingKey":"1"},{"ratingKey":"2"}` },
+			total:     `"totalSize":10,`,
+			wantErr:   "server ignored X-Plex-Container-Start 2",
+			wantCalls: 2,
+		},
+		{
+			name:      "albums stop at the page cap",
+			fetch:     albums,
+			page:      func(start int) string { return fmt.Sprintf(`{"ratingKey":"%d"}`, start) },
+			wantItems: maxPages,
+			wantCalls: maxPages,
+		},
+		{
+			name:      "playlist items repeat the first page",
+			fetch:     playlistTracks,
+			page:      func(int) string { return `{"ratingKey":"1","playlistItemID":11},{"ratingKey":"2","playlistItemID":12}` },
+			wantErr:   "plex: playlist 42 items: server ignored X-Plex-Container-Start 2",
+			wantCalls: 2,
+		},
+		{
+			name:      "playlist items without entry IDs repeat the first page",
+			fetch:     playlistTracks,
+			page:      func(int) string { return `{"ratingKey":"1"}` },
+			wantErr:   "server ignored X-Plex-Container-Start 1",
+			wantCalls: 2,
+		},
+		{
+			name:  "one track at the start of two pages",
+			fetch: playlistTracks,
+			page: func(start int) string {
+				if start > 2 {
+					return ""
+				}
+				return fmt.Sprintf(`{"ratingKey":"1","playlistItemID":%d}`, 100+start)
+			},
+			wantItems: 3,
+			wantCalls: 4,
+		},
+		{
+			name:      "playlist items stop at the page cap",
+			fetch:     playlistTracks,
+			page:      func(start int) string { return fmt.Sprintf(`{"ratingKey":"%d"}`, start) },
+			wantItems: maxPages,
+			wantCalls: maxPages,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calls := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				start, _ := strconv.Atoi(r.URL.Query().Get("X-Plex-Container-Start"))
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprintf(w, `{"MediaContainer":{%s"Metadata":[%s]}}`, tt.total, tt.page(start))
+			}))
+			defer srv.Close()
+
+			n, err := tt.fetch(newTestClient(srv))
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("error = %v, want %q", err, tt.wantErr)
+				}
+			} else if err != nil {
+				t.Fatalf("error = %v", err)
+			}
+			if n != tt.wantItems {
+				t.Errorf("items = %d, want %d", n, tt.wantItems)
+			}
+			if calls != tt.wantCalls {
+				t.Errorf("requests = %d, want %d", calls, tt.wantCalls)
+			}
+		})
 	}
 }
 
@@ -406,4 +692,31 @@ func TestRequestHeaders(t *testing.T) {
 	defer srv.Close()
 
 	_ = newTestClient(srv).Ping()
+}
+
+func TestClientSendsUserAgent(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.UserAgent()
+		w.Write([]byte(`{"MediaContainer":{"friendlyName":"test"}}`))
+	}))
+	defer srv.Close()
+
+	if err := NewClient(srv.URL, "tok").Ping(); err != nil {
+		t.Fatalf("Ping() error: %v", err)
+	}
+	if got != httpclient.UserAgent {
+		t.Errorf("User-Agent = %q, want %q", got, httpclient.UserAgent)
+	}
+}
+
+func TestPingRejectsOversizedBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"MediaContainer":{"friendlyName":"` + strings.Repeat("x", maxResponseBody) + `"}}`))
+	}))
+	defer srv.Close()
+
+	if err := newTestClient(srv).Ping(); !errors.Is(err, httpclient.ErrTooLarge) {
+		t.Fatalf("Ping() error = %v, want httpclient.ErrTooLarge", err)
+	}
 }

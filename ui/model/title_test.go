@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"cliamp/playlist"
+	"github.com/bjarneo/cliamp/playlist"
 )
 
 func TestTerminalTitleValuesForTrack(t *testing.T) {

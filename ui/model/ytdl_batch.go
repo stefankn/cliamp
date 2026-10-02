@@ -4,7 +4,8 @@ import (
 	"net/url"
 	"strings"
 
-	"cliamp/resolve"
+	"github.com/bjarneo/cliamp/playlist"
+	"github.com/bjarneo/cliamp/resolve"
 
 	tea "charm.land/bubbletea/v2"
 )
@@ -22,9 +23,11 @@ func (m *Model) resetYTDLBatch() {
 	m.ytdlBatch.loading = false
 }
 
-// initYTDLBatch detects a YouTube Radio URL among the given source URLs and
-// kicks off incremental batch loading. The offset is derived from the known
-// initial fetch size (resolve.YTDLRadioInitialItems) so it stays correct
+// initYTDLBatch detects YouTube URLs with a list= parameter among the given
+// source URLs and kicks off incremental batch loading. It triggers for any
+// YouTube Music URL with a playlist (list=) and for any URL with an RD-prefix
+// playlist (YouTube auto-generated Radio/Mix). The offset is derived from the
+// known initial fetch size (resolve.YTDLRadioInitialItems) so it stays correct
 // regardless of how many tracks other URLs contributed to the same load.
 func (m *Model) initYTDLBatch(urls []string) tea.Cmd {
 	for _, u := range urls {
@@ -32,7 +35,11 @@ func (m *Model) initYTDLBatch(urls []string) tea.Cmd {
 		if err != nil {
 			continue
 		}
-		if strings.HasPrefix(parsed.Query().Get("list"), "RD") {
+		list := parsed.Query().Get("list")
+		if list == "" {
+			continue
+		}
+		if playlist.IsYouTubeMusicURL(u) || strings.HasPrefix(list, "RD") {
 			m.ytdlBatch.gen++
 			m.ytdlBatch.url = u
 			m.ytdlBatch.offset = resolve.YTDLRadioInitialItems

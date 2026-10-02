@@ -3,31 +3,42 @@
 package pluginmgr
 
 import (
+	"bufio"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
+	"unicode"
 
-	lua "github.com/yuin/gopher-lua"
-
-	"cliamp/internal/appdir"
-	"cliamp/luaplugin"
+	"github.com/bjarneo/cliamp/internal/appdir"
+	"github.com/bjarneo/cliamp/internal/fileutil"
+	"github.com/bjarneo/cliamp/internal/httpclient"
+	"github.com/bjarneo/cliamp/internal/plugintrust"
+	"github.com/bjarneo/cliamp/luaplugin"
 )
 
-var httpClient = &http.Client{Timeout: 30 * time.Second}
+var httpClient = httpclient.NewAPI(30 * time.Second)
 
 const maxPluginSize = 1 << 20 // 1 MB
 
+var (
+	input  io.Reader = os.Stdin
+	output io.Writer = os.Stdout
+)
+
 // pluginInfo holds metadata extracted from a plugin's register() call.
 type pluginInfo struct {
-	file        string
-	name        string
-	version     string
-	description string
-	typ         string
+	luaplugin.Metadata
+	id    string // installed name, as luaplugin.Discover reports it
+	path  string
+	trust string
+	err   error
 }
 
 // List prints all installed plugins with their metadata.
@@ -38,40 +49,83 @@ func List() error {
 	}
 
 	plugins, err := scanPlugins(dir)
-	if err != nil {
-		fmt.Println("No plugins installed.")
+	if err != nil || len(plugins) == 0 {
+		fmt.Fprintln(output, "No plugins installed.")
 		return nil
 	}
-	if len(plugins) == 0 {
-		fmt.Println("No plugins installed.")
-		return nil
+
+	// Like the player, treat every plugin as untrusted when the manifest
+	// does not load, and return the error after the list.
+	manifest, trustErr := plugintrust.Load(dir)
+	if trustErr != nil {
+		manifest = plugintrust.Manifest{}
+	}
+	for i := range plugins {
+		switch err := plugintrust.Verify(manifest, plugins[i].id, plugins[i].path); {
+		case err == nil:
+			plugins[i].trust = "trusted"
+		case err == plugintrust.ErrHashMismatch:
+			plugins[i].trust = "changed"
+		default:
+			plugins[i].trust = "untrusted"
+		}
+	}
+
+	// The metadata comes from plugin code that may be untrusted. Drop its
+	// control characters, so it cannot move the cursor or hide text.
+	for i := range plugins {
+		plugins[i].Name = printable(plugins[i].Name)
+		plugins[i].Version = printable(plugins[i].Version)
+		plugins[i].Description = printable(plugins[i].Description)
 	}
 
 	// Calculate column widths.
 	nameW, typeW, verW := 4, 4, 7 // "NAME", "TYPE", "VERSION"
 	for _, p := range plugins {
-		if len(p.name) > nameW {
-			nameW = len(p.name)
+		if len(p.Name) > nameW {
+			nameW = len(p.Name)
 		}
-		if len(p.typ) > typeW {
-			typeW = len(p.typ)
+		if len(p.Type) > typeW {
+			typeW = len(p.Type)
 		}
-		if len(p.version) > verW {
-			verW = len(p.version)
+		if len(p.Version) > verW {
+			verW = len(p.Version)
 		}
 	}
 
-	fmt.Printf("%-*s  %-*s  %-*s  %s\n", nameW, "NAME", typeW, "TYPE", verW, "VERSION", "DESCRIPTION")
+	fmt.Fprintf(output, "%-*s  %-*s  %-*s  %-9s  %s\n", nameW, "NAME", typeW, "TYPE", verW, "VERSION", "TRUST", "DESCRIPTION")
 	for _, p := range plugins {
-		fmt.Printf("%-*s  %-*s  %-*s  %s\n", nameW, p.name, typeW, p.typ, verW, p.version, p.description)
+		fmt.Fprintf(output, "%-*s  %-*s  %-*s  %-9s  %s\n", nameW, p.Name, typeW, p.Type, verW, p.Version, p.trust, p.Description)
+	}
+	if trustErr != nil {
+		return manifestError(dir, trustErr)
 	}
 	return nil
 }
 
+// printable returns s without control characters, such as ESC or a newline.
+func printable(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+// manifestError explains how to recover from a trust manifest that does not
+// load. cliamp plugins trust cannot add to such a file.
+func manifestError(dir string, err error) error {
+	return fmt.Errorf("%w: delete %s, then run `cliamp plugins trust <name>` for each plugin", err, plugintrust.ManifestPath(dir))
+}
+
 // Install downloads a plugin from the given source and saves it to the plugins directory.
-func Install(source string) error {
+func Install(source string, assumeYes ...bool) error {
 	urls, name, err := resolveSource(source)
 	if err != nil {
+		return err
+	}
+	if err := validateName(name); err != nil {
 		return err
 	}
 
@@ -79,8 +133,11 @@ func Install(source string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("creating plugins directory: %w", err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return fmt.Errorf("securing plugins directory: %w", err)
 	}
 
 	// Check if already installed (file or directory).
@@ -91,11 +148,15 @@ func Install(source string) error {
 	if info, err := os.Stat(filepath.Join(dir, name)); err == nil && info.IsDir() {
 		return fmt.Errorf("plugin %q already exists as directory (remove it first with: cliamp plugins remove %s)", name, name)
 	}
+	// Approve needs the manifest. Check it before the download and the prompt.
+	if _, err := plugintrust.Load(dir); err != nil {
+		return manifestError(dir, err)
+	}
 
 	// Try each candidate URL.
 	var body []byte
 	for _, u := range urls {
-		fmt.Printf("Trying %s...\n", u)
+		fmt.Fprintf(output, "Trying %s...\n", u)
 		b, err := download(u)
 		if err == nil {
 			body = b
@@ -106,41 +167,144 @@ func Install(source string) error {
 		return fmt.Errorf("could not download plugin from any of: %s", strings.Join(urls, ", "))
 	}
 
-	if err := os.WriteFile(dest, body, 0o644); err != nil {
-		return fmt.Errorf("writing plugin: %w", err)
+	md, err := luaplugin.ReadMetadata(string(body))
+	if err != nil {
+		return fmt.Errorf("inspect plugin metadata: %w", err)
+	}
+	hash := plugintrust.Hash(body)
+	fmt.Fprintf(output, "Source: %s\nSHA-256: %s\nDeclared permissions: %s\nImplicit access: unrestricted reads; allowlisted writes; public HTTP\n",
+		source, hash, displayPermissions(md.Permissions))
+	yes := len(assumeYes) > 0 && assumeYes[0]
+	if !yes {
+		fmt.Fprint(output, "Trust and install this plugin? [y/N] ")
+		answer, err := bufio.NewReader(input).ReadString('\n')
+		if err != nil && len(answer) == 0 {
+			return errors.New("approval required; rerun with --yes for non-interactive installation")
+		}
+		answer = strings.ToLower(strings.TrimSpace(answer))
+		if answer != "y" && answer != "yes" {
+			return errors.New("plugin installation not approved")
+		}
 	}
 
-	fmt.Printf("Installed %s → %s\n", name, dest)
+	if err := fileutil.WriteFileAtomic(dest, body, 0o600); err != nil {
+		return fmt.Errorf("writing plugin: %w", err)
+	}
+	if err := plugintrust.ApproveHash(dir, name, dest, hash, md.Permissions); err != nil {
+		_ = os.Remove(dest)
+		return fmt.Errorf("recording plugin trust: %w", err)
+	}
+
+	fmt.Fprintf(output, "Installed %s → %s\n", name, dest)
 	return nil
 }
 
-// Remove deletes a plugin by name.
-func Remove(name string) error {
+// Trust approves the current contents of an installed plugin.
+func Trust(name string, assumeYes bool) error {
+	if err := validateName(name); err != nil {
+		return err
+	}
 	dir, err := appdir.PluginDir()
 	if err != nil {
 		return err
 	}
+	files, err := luaplugin.Discover(dir)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	i := slices.IndexFunc(files, func(f luaplugin.PluginFile) bool { return f.Name == name })
+	if i < 0 {
+		return fmt.Errorf("plugin %q not found", name)
+	}
+	path := files[i].Path
+	if _, err := plugintrust.Load(dir); err != nil {
+		return manifestError(dir, err)
+	}
+	// Read the file once, so the permissions and the hash that the prompt
+	// shows come from the same content.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	md, err := luaplugin.ReadMetadata(string(data))
+	if err != nil {
+		return fmt.Errorf("inspect plugin metadata: %w", err)
+	}
+	hash := plugintrust.Hash(data)
+	fmt.Fprintf(output, "Plugin: %s\nSHA-256: %s\nDeclared permissions: %s\nImplicit access: unrestricted reads; allowlisted writes; public HTTP\n",
+		name, hash, displayPermissions(md.Permissions))
+	if !assumeYes {
+		fmt.Fprint(output, "Trust this plugin content? [y/N] ")
+		answer, readErr := bufio.NewReader(input).ReadString('\n')
+		if readErr != nil && len(answer) == 0 {
+			return errors.New("approval required; rerun with --yes")
+		}
+		answer = strings.ToLower(strings.TrimSpace(answer))
+		if answer != "y" && answer != "yes" {
+			return errors.New("plugin trust not approved")
+		}
+	}
+	if err := plugintrust.ApproveHash(dir, name, path, hash, md.Permissions); err != nil {
+		if errors.Is(err, plugintrust.ErrHashMismatch) {
+			return fmt.Errorf("plugin %q changed after cliamp showed it; run `cliamp plugins trust %s` again", name, name)
+		}
+		return err
+	}
+	return nil
+}
+
+func validateName(name string) error {
+	if name == "" || name == "." || name == ".." || filepath.Base(name) != name || strings.ContainsAny(name, `/\\`) {
+		return fmt.Errorf("invalid plugin name %q", name)
+	}
+	return nil
+}
+
+func displayPermissions(perms []string) string {
+	if len(perms) == 0 {
+		return "none"
+	}
+	return strings.Join(perms, ", ")
+}
+
+// Remove deletes a plugin by name and revokes its approval.
+func Remove(name string) error {
+	if err := validateName(name); err != nil {
+		return err
+	}
+	dir, err := appdir.PluginDir()
+	if err != nil {
+		return err
+	}
+	// Revoke needs the manifest. Check it before the plugin is gone.
+	if _, err := plugintrust.Load(dir); err != nil {
+		return manifestError(dir, err)
+	}
 
 	// Try single file first, then directory.
 	filePath := filepath.Join(dir, name+".lua")
+	dirPath := filepath.Join(dir, name)
+	var removed string
 	if _, err := os.Stat(filePath); err == nil {
 		if err := os.Remove(filePath); err != nil {
 			return fmt.Errorf("removing plugin: %w", err)
 		}
-		fmt.Printf("Removed %s\n", filePath)
-		return nil
-	}
-
-	dirPath := filepath.Join(dir, name)
-	if info, err := os.Stat(dirPath); err == nil && info.IsDir() {
+		removed = filePath
+	} else if info, err := os.Stat(dirPath); err == nil && info.IsDir() {
 		if err := os.RemoveAll(dirPath); err != nil {
 			return fmt.Errorf("removing plugin directory: %w", err)
 		}
-		fmt.Printf("Removed %s\n", dirPath)
-		return nil
+		removed = dirPath
+	} else {
+		return fmt.Errorf("plugin %q not found", name)
 	}
+	fmt.Fprintf(output, "Removed %s\n", removed)
 
-	return fmt.Errorf("plugin %q not found", name)
+	// A stale approval would trust a later file with the same content.
+	if err := plugintrust.Revoke(dir, name); err != nil {
+		return fmt.Errorf("revoke plugin approval: %w", err)
+	}
+	return nil
 }
 
 func download(url string) ([]byte, error) {
@@ -167,87 +331,32 @@ func download(url string) ([]byte, error) {
 	return body, nil
 }
 
-// scanPlugins reads the plugin directory and extracts metadata from each plugin
-// using a lightweight Lua VM.
+// scanPlugins lists the plugins that luaplugin.Discover finds in dir, with
+// the metadata of each one.
 func scanPlugins(dir string) ([]pluginInfo, error) {
-	entries, err := os.ReadDir(dir)
+	files, err := luaplugin.Discover(dir)
 	if err != nil {
 		return nil, err
 	}
-
-	var plugins []pluginInfo
-	for _, e := range entries {
-		var path, file string
-		if e.IsDir() {
-			init := filepath.Join(dir, e.Name(), "init.lua")
-			if _, err := os.Stat(init); err != nil {
-				continue
-			}
-			path = init
-			file = e.Name() + "/"
-		} else if strings.HasSuffix(e.Name(), ".lua") {
-			path = filepath.Join(dir, e.Name())
-			file = e.Name()
-		} else {
-			continue
-		}
-
-		info := extractMetadata(path)
-		info.file = file
-		if info.name == "" {
-			info.name = strings.TrimSuffix(e.Name(), ".lua")
+	plugins := make([]pluginInfo, 0, len(files))
+	for _, f := range files {
+		info := extractMetadata(f.Path)
+		info.id, info.path = f.Name, f.Path
+		if info.Name == "" {
+			info.Name = f.Name
 		}
 		plugins = append(plugins, info)
 	}
 	return plugins, nil
 }
 
-// extractMetadata runs a Lua file in a minimal VM to capture the plugin.register() call.
+// extractMetadata reads a plugin file and inspects it with
+// luaplugin.ReadMetadata, which checks plugin.register() as the player does.
 func extractMetadata(path string) pluginInfo {
-	L := lua.NewState(lua.Options{SkipOpenLibs: false})
-	defer L.Close()
-
-	// Apply the same sandbox as the runtime: extractMetadata runs DoFile on
-	// the whole plugin file (not just register()), so top-level code must not
-	// have access to os.execute/io/dofile when merely listing plugins.
-	luaplugin.Sandbox(L)
-
-	var info pluginInfo
-
-	// Stub out plugin.register() to capture metadata without side effects.
-	pluginTbl := L.NewTable()
-	L.SetField(pluginTbl, "register", L.NewFunction(func(L *lua.LState) int {
-		opts := L.CheckTable(1)
-		if v := opts.RawGetString("name"); v != lua.LNil {
-			info.name = v.String()
-		}
-		if v := opts.RawGetString("version"); v != lua.LNil {
-			info.version = v.String()
-		}
-		if v := opts.RawGetString("description"); v != lua.LNil {
-			info.description = v.String()
-		}
-		if v := opts.RawGetString("type"); v != lua.LNil {
-			info.typ = v.String()
-		}
-		// Return a dummy object with stub on/config methods.
-		obj := L.NewTable()
-		noop := L.NewFunction(func(L *lua.LState) int {
-			L.Push(lua.LNil)
-			return 1
-		})
-		L.SetField(obj, "on", noop)
-		L.SetField(obj, "config", noop)
-		L.Push(obj)
-		return 1
-	}))
-	L.SetGlobal("plugin", pluginTbl)
-
-	// Stub cliamp global so plugins don't error on API calls.
-	L.SetGlobal("cliamp", L.NewTable())
-
-	// Ignore errors — we just want the metadata from register().
-	_ = L.DoFile(path)
-
-	return info
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return pluginInfo{err: err}
+	}
+	md, err := luaplugin.ReadMetadata(string(data))
+	return pluginInfo{Metadata: md, err: err}
 }

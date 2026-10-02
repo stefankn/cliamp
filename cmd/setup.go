@@ -1,7 +1,8 @@
 // Package cmd implements interactive subcommands invoked from the CLI.
 // setup.go contains the provider onboarding wizard reachable via
 // `cliamp setup`. It walks the user through configuring each remote
-// provider (Navidrome, Plex, Jellyfin, Spotify, NetEase, YouTube Music),
+// provider (Navidrome, Lyrion, Plex, Jellyfin, Emby, Audiobookshelf,
+// Spotify, Qobuz, Tidal, NetEase, Mixcloud, YouTube Music),
 // validates the connection where possible, and writes the resulting
 // TOML section to ~/.config/cliamp/config.toml.
 //
@@ -11,12 +12,10 @@ package cmd
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"io/fs"
+	"maps"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -25,12 +24,15 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
-	"cliamp/external/emby"
-	"cliamp/external/jellyfin"
-	"cliamp/external/navidrome"
-	"cliamp/external/netease"
-	"cliamp/external/plex"
-	"cliamp/internal/appdir"
+	"github.com/bjarneo/cliamp/config"
+	"github.com/bjarneo/cliamp/external/audiobookshelf"
+	"github.com/bjarneo/cliamp/external/emby"
+	"github.com/bjarneo/cliamp/external/jellyfin"
+	"github.com/bjarneo/cliamp/external/lyrion"
+	"github.com/bjarneo/cliamp/external/mixcloud"
+	"github.com/bjarneo/cliamp/external/navidrome"
+	"github.com/bjarneo/cliamp/external/netease"
+	"github.com/bjarneo/cliamp/external/plex"
 )
 
 // Setup launches the interactive wizard. Returns nil on clean exit.
@@ -63,8 +65,12 @@ type providerSpec struct {
 	fields  []fieldSpec
 	// validate runs a probe against the live server. Nil skips validation.
 	validate func(map[string]string) error
-	// body returns the TOML block body (no header).
-	body func(map[string]string) string
+	// body returns the keys that setup writes into the section.
+	body func(map[string]string) []config.KeyValue
+	// owned lists every key that setup manages in the section. A save
+	// removes each owned key that body leaves out, such as token when
+	// Jellyfin moves to password login. All other keys and comments stay.
+	owned []string
 	// extraValidate runs after the form before validate, e.g. to enforce
 	// "token OR (user+password)" for Jellyfin.
 	extraValidate func(map[string]string) error
@@ -87,11 +93,15 @@ type pickerOption struct {
 // Picker keys are stored in the values map alongside real field keys; the
 // leading underscore distinguishes them from TOML field names.
 const (
-	keyJellyfinAuth   = "_auth"
-	keyEmbyAuth       = "_emby_auth"
-	keyNetEaseBrowser = "_netease_browser"
-	keyYTMusicMode    = "_mode"
-	keySpotifyMode    = "_spotify_mode"
+	keyJellyfinAuth    = "_auth"
+	keyEmbyAuth        = "_emby_auth"
+	keyABSAuth         = "_abs_auth"
+	keyNetEaseBrowser  = "_netease_browser"
+	keyYTMusicMode     = "_mode"
+	keySpotifyMode     = "_spotify_mode"
+	keyQobuzQuality    = "_qobuz_quality"
+	keyTidalQuality    = "_tidal_quality"
+	keyMixcloudBrowser = "_mixcloud_browser"
 )
 
 func providers() []providerSpec {
@@ -112,12 +122,39 @@ func providers() []providerSpec {
 			validate: func(v map[string]string) error {
 				return navidrome.New(v["url"], v["user"], v["password"]).Ping()
 			},
-			body: func(v map[string]string) string {
-				return strings.Join([]string{
-					fmt.Sprintf("url      = %q", v["url"]),
-					fmt.Sprintf("user     = %q", v["user"]),
-					fmt.Sprintf("password = %q", v["password"]),
-				}, "\n")
+			owned: []string{"url", "user", "password"},
+			body: func(v map[string]string) []config.KeyValue {
+				return []config.KeyValue{
+					quotedKV("url", v["url"]),
+					quotedKV("user", v["user"]),
+					quotedKV("password", v["password"]),
+				}
+			},
+		},
+		{
+			key:     "lyrion",
+			name:    "Lyrion Music Server",
+			section: "lyrion",
+			intro: []string{
+				"Self-hosted server for Squeezebox players, formerly Logitech Media Server.",
+				"Username and password are only needed if the server has password protection.",
+				"Docs: cliamp.stream → docs/lyrion.md",
+			},
+			fields: []fieldSpec{
+				{key: "url", label: "Server URL", help: "e.g. http://nas.local:9000", required: true},
+				{key: "user", label: "Username", help: "leave blank if the server is unprotected"},
+				{key: "password", label: "Password", secret: true},
+			},
+			validate: func(v map[string]string) error {
+				return lyrion.New(v["url"], v["user"], v["password"]).Ping()
+			},
+			owned: []string{"url", "user", "password"},
+			body: func(v map[string]string) []config.KeyValue {
+				return []config.KeyValue{
+					quotedKV("url", v["url"]),
+					quotedKV("user", v["user"]),
+					quotedKV("password", v["password"]),
+				}
 			},
 		},
 		{
@@ -131,15 +168,21 @@ func providers() []providerSpec {
 			fields: []fieldSpec{
 				{key: "url", label: "Server URL", help: "e.g. http://192.168.1.10:32400", required: true},
 				{key: "token", label: "X-Plex-Token", required: true, secret: true},
+				{key: "libraries", label: "Music libraries (optional)", help: "comma-separated names to include; blank loads every music library"},
 			},
 			validate: func(v map[string]string) error {
 				return plex.NewClient(v["url"], v["token"]).Ping()
 			},
-			body: func(v map[string]string) string {
-				return strings.Join([]string{
-					fmt.Sprintf("url   = %q", v["url"]),
-					fmt.Sprintf("token = %q", v["token"]),
-				}, "\n")
+			owned: []string{"url", "token", "libraries"},
+			body: func(v map[string]string) []config.KeyValue {
+				kv := []config.KeyValue{
+					quotedKV("url", v["url"]),
+					quotedKV("token", v["token"]),
+				}
+				if libraries := setupStringList(v["libraries"]); libraries != "" {
+					kv = append(kv, rawKV("libraries", libraries))
+				}
+				return kv
 			},
 		},
 		{
@@ -170,17 +213,19 @@ func providers() []providerSpec {
 			validate: func(v map[string]string) error {
 				return jellyfin.NewClient(v["url"], v["token"], "", v["user"], v["password"]).Ping()
 			},
-			body: func(v map[string]string) string {
-				lines := []string{fmt.Sprintf("url      = %q", v["url"])}
+			// user_id belongs to the account of the old credentials.
+			owned: []string{"url", "token", "user", "password", "user_id"},
+			body: func(v map[string]string) []config.KeyValue {
+				kv := []config.KeyValue{quotedKV("url", v["url"])}
 				if v[keyJellyfinAuth] == "token" {
-					lines = append(lines, fmt.Sprintf("token    = %q", v["token"]))
+					kv = append(kv, quotedKV("token", v["token"]))
 				} else {
-					lines = append(lines,
-						fmt.Sprintf("user     = %q", v["user"]),
-						fmt.Sprintf("password = %q", v["password"]),
+					kv = append(kv,
+						quotedKV("user", v["user"]),
+						quotedKV("password", v["password"]),
 					)
 				}
-				return strings.Join(lines, "\n")
+				return kv
 			},
 		},
 		{
@@ -216,20 +261,68 @@ func providers() []providerSpec {
 				}
 				return nil
 			},
-			body: func(v map[string]string) string {
-				lines := []string{fmt.Sprintf("url      = %q", v["url"])}
+			// user_id belongs to the account of the old credentials.
+			owned: []string{"url", "token", "user", "password", "user_id"},
+			body: func(v map[string]string) []config.KeyValue {
+				kv := []config.KeyValue{quotedKV("url", v["url"])}
 				if v[keyEmbyAuth] == "token" {
-					lines = append(lines, fmt.Sprintf("token    = %q", v["token"]))
+					kv = append(kv, quotedKV("token", v["token"]))
 					if v["user"] != "" {
-						lines = append(lines, fmt.Sprintf("user     = %q", v["user"]))
+						kv = append(kv, quotedKV("user", v["user"]))
 					}
 				} else {
-					lines = append(lines,
-						fmt.Sprintf("user     = %q", v["user"]),
-						fmt.Sprintf("password = %q", v["password"]),
+					kv = append(kv,
+						quotedKV("user", v["user"]),
+						quotedKV("password", v["password"]),
 					)
 				}
-				return strings.Join(lines, "\n")
+				return kv
+			},
+		},
+		{
+			key:     "audiobookshelf",
+			name:    "Audiobookshelf",
+			section: "audiobookshelf",
+			intro: []string{
+				"Audiobooks and podcasts from your own Audiobookshelf server.",
+				"Authenticate with an API key (Settings → Users → API Keys)",
+				"or with your username and password.",
+			},
+			picker: &pickerSpec{
+				key:   keyABSAuth,
+				label: "Authentication",
+				options: []pickerOption{
+					{value: "token", label: "API key"},
+					{value: "password", label: "Username + password"},
+				},
+			},
+			fields: []fieldSpec{
+				{key: "url", label: "Server URL", help: "e.g. https://abs.example.com", required: true},
+				{key: "token", label: "API key", required: true, secret: true,
+					onlyIf: func(v map[string]string) bool { return v[keyABSAuth] == "token" }},
+				{key: "user", label: "Username", required: true,
+					onlyIf: func(v map[string]string) bool { return v[keyABSAuth] == "password" }},
+				{key: "password", label: "Password", required: true, secret: true,
+					onlyIf: func(v map[string]string) bool { return v[keyABSAuth] == "password" }},
+			},
+			validate: func(v map[string]string) error {
+				if err := audiobookshelf.NewClient(v["url"], v["token"], v["user"], v["password"], nil).Ping(); err != nil {
+					return fmt.Errorf("audiobookshelf: validation: %w", err)
+				}
+				return nil
+			},
+			owned: []string{"url", "token", "user", "password"},
+			body: func(v map[string]string) []config.KeyValue {
+				kv := []config.KeyValue{quotedKV("url", v["url"])}
+				if v[keyABSAuth] == "token" {
+					kv = append(kv, quotedKV("token", v["token"]))
+				} else {
+					kv = append(kv,
+						quotedKV("user", v["user"]),
+						quotedKV("password", v["password"]),
+					)
+				}
+				return kv
 			},
 		},
 		{
@@ -242,14 +335,15 @@ func providers() []providerSpec {
 				"Recommended: register your own Spotify Developer app at",
 				"developer.spotify.com/dashboard (redirect URI",
 				"http://127.0.0.1:19872/login). Your own client_id gives you a",
-				"private rate-limit quota and works for playback, library, and",
-				"playlists. Apps registered after Nov 27, 2024 can't use",
-				"/v1/search though — that's a Spotify dev-mode restriction.",
+				"private Web API rate-limit quota for library, playlists, and search.",
+				"Playback is authorized separately, so first use completes two",
+				"steps in one browser tab. Development Mode caps /v1/search at",
+				"10 results per request; cliamp pages automatically with offset.",
 				"",
 				"Alternative: cliamp ships a built-in client_id (the librespot",
-				"keymaster) that bypasses the search restriction. It's shared",
-				"with every librespot- and spotify-player-based client, so you",
-				"may see occasional 429 errors when the pool is busy.",
+				"keymaster) if you do not want to register an app. It's shared with",
+				"every librespot- and spotify-player-based client, so you may see",
+				"occasional 429 errors when the pool is busy.",
 			},
 			picker: &pickerSpec{
 				key:   keySpotifyMode,
@@ -274,17 +368,80 @@ func providers() []providerSpec {
 				}
 				return nil
 			},
-			body: func(v map[string]string) string {
+			// enabled is owned, so setup removes an old enabled = false.
+			owned: []string{"enabled", "client_id", "bitrate"},
+			body: func(v map[string]string) []config.KeyValue {
 				br := v["bitrate"]
 				if br == "" {
 					br = "320"
 				}
-				lines := []string{}
+				var kv []config.KeyValue
 				if v[keySpotifyMode] == "custom" && v["client_id"] != "" {
-					lines = append(lines, fmt.Sprintf("client_id = %q", v["client_id"]))
+					kv = append(kv, quotedKV("client_id", v["client_id"]))
 				}
-				lines = append(lines, fmt.Sprintf("bitrate   = %s", br))
-				return strings.Join(lines, "\n")
+				return append(kv, rawKV("bitrate", br))
+			},
+		},
+		{
+			key:     "qobuz",
+			name:    "Qobuz",
+			section: "qobuz",
+			intro: []string{
+				"Lossless streaming. Requires an active Qobuz subscription.",
+				"",
+				"No API credentials needed - cliamp obtains them automatically.",
+				"After setup, launch cliamp, select Qobuz, and press Enter to",
+				"sign in via OAuth in your browser. Hi-Res tiers require a plan",
+				"that includes them.",
+			},
+			picker: &pickerSpec{
+				key:   keyQobuzQuality,
+				label: "Stream quality",
+				options: []pickerOption{
+					{value: "6", label: "FLAC 16-bit/44.1kHz (CD) - recommended"},
+					{value: "7", label: "FLAC 24-bit up to 96kHz (Hi-Res)"},
+					{value: "27", label: "FLAC 24-bit up to 192kHz (Hi-Res)"},
+					{value: "5", label: "MP3 320kbps"},
+				},
+			},
+			owned: []string{"enabled", "quality"},
+			body: func(v map[string]string) []config.KeyValue {
+				q := v[keyQobuzQuality]
+				if q == "" {
+					q = "6"
+				}
+				return []config.KeyValue{rawKV("enabled", "true"), rawKV("quality", q)}
+			},
+		},
+		{
+			key:     "tidal",
+			name:    "Tidal",
+			section: "tidal",
+			intro: []string{
+				"Lossless streaming. Requires a paid Tidal subscription",
+				"(every paid plan includes lossless FLAC).",
+				"",
+				"No API credentials needed - cliamp uses built-in ones.",
+				"After setup, launch cliamp, select Tidal, and press Enter to",
+				"sign in: approve the link.tidal.com device code in a browser.",
+			},
+			picker: &pickerSpec{
+				key:   keyTidalQuality,
+				label: "Stream quality",
+				options: []pickerOption{
+					{value: "lossless", label: "FLAC (hi-res masters; AAC 320 otherwise) - recommended"},
+					{value: "hires", label: "FLAC hi-res (same delivery as lossless)"},
+					{value: "high", label: "AAC 320kbps"},
+					{value: "low", label: "AAC 96kbps"},
+				},
+			},
+			owned: []string{"enabled", "quality"},
+			body: func(v map[string]string) []config.KeyValue {
+				q := v[keyTidalQuality]
+				if q == "" {
+					q = "lossless"
+				}
+				return []config.KeyValue{rawKV("enabled", "true"), quotedKV("quality", q)}
 			},
 		},
 		{
@@ -328,16 +485,98 @@ func providers() []providerSpec {
 				v["user_id"] = acc.UserID
 				return nil
 			},
-			body: func(v map[string]string) string {
-				browser := netEaseCookiesFrom(v)
-				lines := []string{
-					"enabled      = true",
-					fmt.Sprintf("cookies_from = %q", browser),
+			owned: []string{"enabled", "cookies_from", "user_id"},
+			body: func(v map[string]string) []config.KeyValue {
+				kv := []config.KeyValue{
+					rawKV("enabled", "true"),
+					quotedKV("cookies_from", netEaseCookiesFrom(v)),
 				}
 				if v["user_id"] != "" {
-					lines = append(lines, fmt.Sprintf("user_id      = %q", v["user_id"]))
+					kv = append(kv, quotedKV("user_id", v["user_id"]))
 				}
-				return strings.Join(lines, "\n")
+				return kv
+			},
+		},
+		{
+			key:     "mixcloud",
+			name:    "Mixcloud",
+			section: "mixcloud",
+			intro: []string{
+				"Browse and play Mixcloud shows through its public API and yt-dlp.",
+				"A username adds your public library, following stream, and creators.",
+				"An optional developer access token adds /me and Listen Later.",
+				"Choose browser cookies for subscriber-only or signed-in playback.",
+				"Docs: cliamp.stream → docs/mixcloud.md",
+			},
+			picker: &pickerSpec{
+				key:   keyMixcloudBrowser,
+				label: "Playback session",
+				options: []pickerOption{
+					{value: "none", label: "Public shows only (no browser cookies)"},
+					{value: "chrome", label: "Chrome"},
+					{value: "safari", label: "Safari"},
+					{value: "firefox", label: "Firefox"},
+					{value: "brave", label: "Brave"},
+					{value: "edge", label: "Edge"},
+					{value: "chromium", label: "Chromium"},
+					{value: "opera", label: "Opera"},
+					{value: "vivaldi", label: "Vivaldi"},
+					{value: "whale", label: "Whale"},
+					{value: "custom", label: "Custom browser/profile"},
+				},
+			},
+			fields: []fieldSpec{
+				{key: "username", label: "Mixcloud username (optional)", help: "adds account views and followed creators"},
+				{key: "access_token", label: "Developer API access token (optional)", help: "enables /me and Listen Later", secret: true},
+				{key: "cookies_from", label: "Custom browser/profile", help: "e.g. chrome:Profile 1, firefox:default-release", required: true,
+					onlyIf: func(v map[string]string) bool { return v[keyMixcloudBrowser] == "custom" }},
+				{key: "styles", label: "Music styles (optional)", help: "comma-separated; blank uses cliamp defaults"},
+				{key: "max_items", label: "Items per view", help: fmt.Sprintf("%d-%d", mixcloud.MinItems, mixcloud.MaxItemsLimit), defaultV: strconv.Itoa(mixcloud.DefaultMaxItems)},
+				{key: "stream_creators", label: "Creators in Stream", help: fmt.Sprintf("%d-%d", mixcloud.MinItems, mixcloud.MaxStreamCreators), defaultV: strconv.Itoa(mixcloud.DefaultStreamCreators)},
+			},
+			extraValidate: func(v map[string]string) error {
+				limits := []struct {
+					key, label string
+					max        int
+				}{
+					{key: "max_items", label: "items per view", max: mixcloud.MaxItemsLimit},
+					{key: "stream_creators", label: "stream creators", max: mixcloud.MaxStreamCreators},
+				}
+				for _, field := range limits {
+					n, err := strconv.Atoi(strings.TrimSpace(v[field.key]))
+					if err != nil {
+						return fmt.Errorf("%s must be a number", field.label)
+					}
+					if n < mixcloud.MinItems || n > field.max {
+						return fmt.Errorf("%s is outside its supported range", field.label)
+					}
+				}
+				return nil
+			},
+			owned: []string{"enabled", "username", "access_token", "cookies_from", "styles", "max_items", "stream_creators"},
+			body: func(v map[string]string) []config.KeyValue {
+				kv := []config.KeyValue{rawKV("enabled", "true")}
+				if username := strings.TrimSpace(v["username"]); username != "" {
+					kv = append(kv, quotedKV("username", username))
+				}
+				if token := strings.TrimSpace(v["access_token"]); token != "" {
+					kv = append(kv, quotedKV("access_token", token))
+				}
+				if browser := mixcloudCookiesFrom(v); browser != "" {
+					kv = append(kv, quotedKV("cookies_from", browser))
+				}
+				if styles := setupStringList(v["styles"]); styles != "" {
+					kv = append(kv, rawKV("styles", styles))
+				}
+				maxItems := strings.TrimSpace(v["max_items"])
+				if maxItems == "" {
+					maxItems = strconv.Itoa(mixcloud.DefaultMaxItems)
+				}
+				streamCreators := strings.TrimSpace(v["stream_creators"])
+				if streamCreators == "" {
+					streamCreators = strconv.Itoa(mixcloud.DefaultStreamCreators)
+				}
+				return append(kv, rawKV("max_items", maxItems), rawKV("stream_creators", streamCreators))
 			},
 		},
 		{
@@ -345,45 +584,49 @@ func providers() []providerSpec {
 			name:    "YouTube Music",
 			section: "ytmusic",
 			intro: []string{
-				"Works out of the box with built-in fallback credentials.",
-				"Provide your own OAuth client to skip the shared pool, and/or",
-				"a browser name for cookie-based age-gated playback.",
+				"Browse playlists and liked music with browser cookies (zero OAuth setup),",
+				"or provide your own Google Cloud OAuth client credentials.",
 			},
 			picker: &pickerSpec{
 				key:   keyYTMusicMode,
 				label: "Mode",
 				options: []pickerOption{
-					{value: "default", label: "Use built-in credentials (recommended)"},
-					{value: "custom", label: "Provide my own OAuth credentials / cookies"},
+					{value: "cookies", label: "Browser cookies (recommended — zero OAuth setup)"},
+					{value: "custom", label: "Provide my own OAuth credentials"},
 					{value: "off", label: "Disable YouTube Music"},
 				},
 			},
 			fields: []fieldSpec{
-				{key: "client_id", label: "OAuth Client ID",
+				{key: "cookies_from", label: "Browser for cookies (optional with OAuth)", help: "e.g. chrome, firefox, brave, chromium; blank uses Chrome in cookie mode",
+					onlyIf: func(v map[string]string) bool { return v[keyYTMusicMode] != "off" }},
+				{key: "client_id", label: "OAuth Client ID", required: true,
 					onlyIf: func(v map[string]string) bool { return v[keyYTMusicMode] == "custom" }},
-				{key: "client_secret", label: "OAuth Client Secret", secret: true,
-					onlyIf: func(v map[string]string) bool { return v[keyYTMusicMode] == "custom" }},
-				{key: "cookies_from", label: "Cookies from browser", help: "e.g. chrome, firefox; blank to skip",
+				{key: "client_secret", label: "OAuth Client Secret", secret: true, required: true,
 					onlyIf: func(v map[string]string) bool { return v[keyYTMusicMode] == "custom" }},
 			},
-			body: func(v map[string]string) string {
+			owned: []string{"enabled", "client_id", "client_secret", "cookies_from"},
+			body: func(v map[string]string) []config.KeyValue {
 				switch v[keyYTMusicMode] {
 				case "off":
-					return "enabled = false"
+					return []config.KeyValue{rawKV("enabled", "false")}
 				case "custom":
-					lines := []string{"enabled = true"}
+					kv := []config.KeyValue{rawKV("enabled", "true")}
 					if v["client_id"] != "" {
-						lines = append(lines, fmt.Sprintf("client_id     = %q", v["client_id"]))
+						kv = append(kv, quotedKV("client_id", v["client_id"]))
 					}
 					if v["client_secret"] != "" {
-						lines = append(lines, fmt.Sprintf("client_secret = %q", v["client_secret"]))
+						kv = append(kv, quotedKV("client_secret", v["client_secret"]))
 					}
 					if v["cookies_from"] != "" {
-						lines = append(lines, fmt.Sprintf("cookies_from  = %q", v["cookies_from"]))
+						kv = append(kv, quotedKV("cookies_from", v["cookies_from"]))
 					}
-					return strings.Join(lines, "\n")
+					return kv
 				default:
-					return "enabled = true"
+					browser := strings.TrimSpace(v["cookies_from"])
+					if browser == "" {
+						browser = "chrome"
+					}
+					return []config.KeyValue{rawKV("enabled", "true"), quotedKV("cookies_from", browser)}
 				}
 			},
 		},
@@ -396,6 +639,41 @@ func netEaseCookiesFrom(v map[string]string) string {
 		return strings.TrimSpace(v["cookies_from"])
 	}
 	return picked
+}
+
+func mixcloudCookiesFrom(v map[string]string) string {
+	picked := strings.TrimSpace(v[keyMixcloudBrowser])
+	if picked == "" || picked == "none" {
+		return ""
+	}
+	if picked == "custom" {
+		return strings.TrimSpace(v["cookies_from"])
+	}
+	return picked
+}
+
+// quotedKV returns a body key with value written as a TOML string.
+func quotedKV(key, value string) config.KeyValue {
+	return config.KeyValue{Key: key, Value: config.QuoteString(value)}
+}
+
+// rawKV returns a body key with value written as is, such as a number, a
+// bool or a list.
+func rawKV(key, value string) config.KeyValue {
+	return config.KeyValue{Key: key, Value: value}
+}
+
+func setupStringList(value string) string {
+	var quoted []string
+	for _, part := range strings.Split(value, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			quoted = append(quoted, config.QuoteString(part))
+		}
+	}
+	if len(quoted) == 0 {
+		return ""
+	}
+	return "[" + strings.Join(quoted, ", ") + "]"
 }
 
 // ----- Bubbletea model ----------------------------------------------------
@@ -443,7 +721,7 @@ type setupModel struct {
 }
 
 func newSetupModel() *setupModel {
-	cfgPath, _ := configFilePath()
+	cfgPath, _ := config.Path()
 	return &setupModel{
 		provs:   providers(),
 		stage:   stageMenu,
@@ -459,7 +737,13 @@ func (m *setupModel) Init() tea.Cmd {
 
 // ----- Messages -----------------------------------------------------------
 
-type validateDoneMsg struct{ err error }
+// validateDoneMsg is the result of a probe. found holds each key that the
+// probe added or changed in its copy of the form values, such as the NetEase
+// user_id.
+type validateDoneMsg struct {
+	err   error
+	found map[string]string
+}
 
 type spinTickMsg struct{}
 
@@ -472,7 +756,15 @@ func runValidateCmd(spec providerSpec, values map[string]string) tea.Cmd {
 		if spec.validate == nil {
 			return validateDoneMsg{}
 		}
-		return validateDoneMsg{err: spec.validate(values)}
+		before := maps.Clone(values)
+		err := spec.validate(values)
+		found := make(map[string]string)
+		for k, v := range values {
+			if old, ok := before[k]; !ok || old != v {
+				found[k] = v
+			}
+		}
+		return validateDoneMsg{err: err, found: found}
 	}
 }
 
@@ -498,7 +790,7 @@ func (m *setupModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case validateDoneMsg:
-		return m.onValidateDone(msg.err)
+		return m.onValidateDone(msg.err, msg.found)
 	}
 	return m, nil
 }
@@ -690,12 +982,21 @@ func (m *setupModel) submitForm() (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// Required-field check (only for visible fields).
+	// Field check (only for visible fields). config.Load reads a $NAME
+	// value from the environment, so a reference to an unset or empty
+	// variable loads as an empty value.
 	for i, idx := range m.visible {
 		f := spec.fields[idx]
-		if f.required && strings.TrimSpace(m.values[f.key]) == "" {
+		v := m.values[f.key]
+		var err error
+		if f.required && strings.TrimSpace(v) == "" {
+			err = fmt.Errorf("%s is required", f.label)
+		} else if name, ok := config.EnvRef(v); ok && os.Getenv(name) == "" {
+			err = fmt.Errorf("%s names an unset or empty environment variable. cliamp reads a $NAME or ${NAME} value from the environment", f.label)
+		}
+		if err != nil {
 			m.fcursor = i
-			m.resultErr = fmt.Errorf("%s is required", f.label)
+			m.resultErr = err
 			m.resultText = ""
 			m.stage = stageResult
 			return m, nil
@@ -710,15 +1011,22 @@ func (m *setupModel) submitForm() (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// Light URL sanity check before any network call.
+	// Light URL sanity check before any network call. A $NAME value stays
+	// as typed, and the check reads the variable.
 	if u, ok := m.values["url"]; ok && u != "" {
+		name, isRef := config.EnvRef(u)
+		if isRef {
+			u = os.Getenv(name)
+		}
 		clean := strings.TrimRight(u, "/")
 		if !looksLikeHTTPURL(clean) {
 			m.resultErr = fmt.Errorf("URL must start with http:// or https://")
 			m.stage = stageResult
 			return m, nil
 		}
-		m.values["url"] = clean
+		if !isRef {
+			m.values["url"] = clean
+		}
 	}
 
 	if spec.validate == nil {
@@ -728,10 +1036,32 @@ func (m *setupModel) submitForm() (tea.Model, tea.Cmd) {
 
 	m.stage = stageValidating
 	m.spinFrame = 0
-	return m, tea.Batch(spinTickCmd(), runValidateCmd(spec, m.values))
+	return m, tea.Batch(spinTickCmd(), runValidateCmd(spec, envResolved(m.values)))
 }
 
-func (m *setupModel) onValidateDone(err error) (tea.Model, tea.Cmd) {
+// envResolved returns a copy of values in which each $NAME or ${NAME} value
+// holds the value of that environment variable. The probe then checks the
+// value that config.Load reads, and the save keeps the reference.
+func envResolved(values map[string]string) map[string]string {
+	out := make(map[string]string, len(values))
+	for k, v := range values {
+		if name, ok := config.EnvRef(v); ok {
+			v = os.Getenv(name)
+		}
+		out[k] = v
+	}
+	return out
+}
+
+// onValidateDone takes the keys that the probe found into the form values,
+// so the save writes them. A key that holds a $NAME or ${NAME} value keeps
+// that reference.
+func (m *setupModel) onValidateDone(err error, found map[string]string) (tea.Model, tea.Cmd) {
+	for k, v := range found {
+		if _, ok := config.EnvRef(m.values[k]); !ok {
+			m.values[k] = v
+		}
+	}
 	if err == nil {
 		return m, m.persistAndDone(false)
 	}
@@ -745,8 +1075,7 @@ func (m *setupModel) onValidateDone(err error) (tea.Model, tea.Cmd) {
 // indicates the user opted to save despite a failed probe.
 func (m *setupModel) persistAndDone(warn bool) tea.Cmd {
 	spec := m.provs[m.pidx]
-	body := spec.body(m.values)
-	if err := saveSection(spec.section, body); err != nil {
+	if err := config.SaveSection(spec.section, spec.body(m.values), spec.owned); err != nil {
 		m.saveFailed = err
 		m.stage = stageResult
 		m.awaitingSave = false
@@ -754,6 +1083,7 @@ func (m *setupModel) persistAndDone(warn bool) tea.Cmd {
 	}
 	m.stage = stageResult
 	m.awaitingSave = false
+	m.resultErr = nil
 	m.resultWarning = warn
 	m.resultText = fmt.Sprintf("Saved [%s] section.", spec.section)
 	return nil
@@ -762,6 +1092,8 @@ func (m *setupModel) persistAndDone(warn bool) tea.Cmd {
 func (m *setupModel) resultKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.awaitingSave {
 		switch strings.ToLower(msg.String()) {
+		case "q":
+			return m, tea.Quit
 		case "y":
 			m.persistAndDone(true)
 			return m, nil
@@ -775,7 +1107,9 @@ func (m *setupModel) resultKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch msg.String() {
-	case "enter", "esc", "q", " ":
+	case "q":
+		return m, tea.Quit
+	case "enter", "esc", " ":
 		m.stage = stageMenu
 		return m, nil
 	}
@@ -971,7 +1305,7 @@ func (m *setupModel) viewResult() string {
 		b.WriteString("\n\n")
 		b.WriteString(m.saveFailed.Error())
 		b.WriteString("\n\n")
-		b.WriteString(hintStyle.Render("Press any key to return to the menu."))
+		b.WriteString(hintStyle.Render("Press Enter or Esc to return to the menu, or q to quit."))
 		return m.card(b.String())
 	}
 
@@ -982,7 +1316,7 @@ func (m *setupModel) viewResult() string {
 		b.WriteString("\n\n")
 		b.WriteString(hintStyle.Render("The config will still load on next launch — useful when the server is offline now."))
 		b.WriteString("\n\n")
-		b.WriteString(accentStyle.Render("Save anyway?  ") + "[y/N]")
+		b.WriteString(accentStyle.Render("Save anyway?  ") + "[y/N]  q quit")
 		return m.card(b.String())
 	}
 
@@ -990,7 +1324,7 @@ func (m *setupModel) viewResult() string {
 		b.WriteString(errStyle.Render("✗ "))
 		b.WriteString(m.resultErr.Error())
 		b.WriteString("\n\n")
-		b.WriteString(hintStyle.Render("Press any key to return to the menu."))
+		b.WriteString(hintStyle.Render("Press Enter or Esc to return to the menu, or q to quit."))
 		return m.card(b.String())
 	}
 
@@ -1002,7 +1336,7 @@ func (m *setupModel) viewResult() string {
 	b.WriteString("\n\n")
 	b.WriteString(dimStyle.Render(m.cfgPath))
 	b.WriteString("\n\n")
-	b.WriteString(hintStyle.Render("Press any key to configure another provider, or q to quit."))
+	b.WriteString(hintStyle.Render("Press Enter or Esc to configure another provider, or q to quit."))
 	return m.card(b.String())
 }
 
@@ -1019,9 +1353,9 @@ func (m *setupModel) viewFooter() string {
 		keys = "ctrl+c cancel"
 	case stageResult:
 		if m.awaitingSave {
-			keys = "y save anyway   n cancel"
+			keys = "y save anyway   n cancel  q quit"
 		} else {
-			keys = "any key continue   q quit"
+			keys = "enter/esc continue   q quit"
 		}
 	}
 	return dimStyle.Render(keys)
@@ -1044,14 +1378,6 @@ func looksLikeHTTPURL(s string) bool {
 	return u.Scheme == "http" || u.Scheme == "https"
 }
 
-func configFilePath() (string, error) {
-	dir, err := appdir.Dir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "config.toml"), nil
-}
-
 // removeLastRune trims the final UTF-8 rune from s.
 func removeLastRune(s string) string {
 	if len(s) > 0 {
@@ -1059,86 +1385,4 @@ func removeLastRune(s string) string {
 		return s[:len(s)-size]
 	}
 	return s
-}
-
-// saveSection rewrites or appends a [section] block in config.toml. The
-// body is the raw TOML between the header and the next section/EOF; it
-// must not contain a header line itself. Existing content for the same
-// section is replaced; everything else is preserved as-is.
-func saveSection(section, body string) error {
-	path, err := configFilePath()
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-
-	header := "[" + section + "]"
-	block := header + "\n" + strings.TrimRight(body, "\n") + "\n"
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if !errors.Is(err, fs.ErrNotExist) {
-			return err
-		}
-		return os.WriteFile(path, []byte(block), 0o644)
-	}
-
-	lines := strings.Split(string(data), "\n")
-	start, end := findSection(lines, section)
-	if start < 0 {
-		out := strings.TrimRight(string(data), "\n")
-		if out != "" {
-			out += "\n\n"
-		}
-		out += block
-		return os.WriteFile(path, []byte(out), 0o644)
-	}
-
-	before := strings.TrimRight(strings.Join(lines[:start], "\n"), "\n")
-	after := ""
-	if end < len(lines) {
-		after = strings.TrimLeft(strings.Join(lines[end:], "\n"), "\n")
-	}
-	var b strings.Builder
-	if before != "" {
-		b.WriteString(before)
-		b.WriteString("\n\n")
-	}
-	b.WriteString(block)
-	if after != "" {
-		b.WriteString("\n")
-		b.WriteString(after)
-		if !strings.HasSuffix(after, "\n") {
-			b.WriteString("\n")
-		}
-	}
-	return os.WriteFile(path, []byte(b.String()), 0o644)
-}
-
-// findSection returns [start, end) line indices for the [name] block in
-// lines, where start points at the header line and end points at the
-// next section header (or len(lines) if it's the last block). Returns
-// (-1, -1) if the section is absent.
-func findSection(lines []string, name string) (int, int) {
-	target := "[" + strings.ToLower(name) + "]"
-	start := -1
-	for i, l := range lines {
-		t := strings.ToLower(strings.TrimSpace(l))
-		if t == target {
-			start = i
-			break
-		}
-	}
-	if start < 0 {
-		return -1, -1
-	}
-	for i := start + 1; i < len(lines); i++ {
-		t := strings.TrimSpace(lines[i])
-		if strings.HasPrefix(t, "[") && strings.HasSuffix(t, "]") {
-			return start, i
-		}
-	}
-	return start, len(lines)
 }

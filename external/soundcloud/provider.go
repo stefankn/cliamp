@@ -15,9 +15,9 @@ import (
 	"slices"
 	"strings"
 
-	"cliamp/playlist"
-	"cliamp/provider"
-	"cliamp/resolve"
+	"github.com/bjarneo/cliamp/playlist"
+	"github.com/bjarneo/cliamp/provider"
+	"github.com/bjarneo/cliamp/resolve"
 )
 
 // Compile-time interface checks.
@@ -58,16 +58,13 @@ var defaultBrowse = []playlist.PlaylistInfo{
 }
 
 // NewFromConfig returns a provider, or nil when SoundCloud is not enabled.
-// Sets resolve's yt-dlp cookies as a side effect when CookiesFrom is non-empty
-// so any yt-dlp invocation (search, browse, playback) uses the user's
-// signed-in session.
+// Registers SoundCloud's yt-dlp cookie source so search, browse, and playback
+// use the user's signed-in session without affecting other providers.
 func NewFromConfig(cfg Config) *Provider {
 	if !cfg.Enabled {
 		return nil
 	}
-	if cfg.CookiesFrom != "" {
-		resolve.SetYTDLCookiesFrom(cfg.CookiesFrom)
-	}
+	resolve.SetYTDLCookiesForHost("soundcloud.com", cfg.CookiesFrom)
 	return &Provider{user: strings.TrimSpace(cfg.User)}
 }
 
@@ -94,12 +91,12 @@ func (p *Provider) Tracks(playlistID string) ([]playlist.Track, error) {
 	if playlistID == "" {
 		return nil, fmt.Errorf("soundcloud: empty playlist id")
 	}
-	return resolve.ResolveYTDLBatch(playlistID, 0, 0)
+	return resolve.ResolveYTDLBatch(playlistID, 0, 0, "")
 }
 
 // SearchTracks runs `yt-dlp scsearch{limit}:{query}` and returns matched
 // tracks. Implements provider.Searcher.
-func (p *Provider) SearchTracks(_ context.Context, query string, limit int) ([]playlist.Track, error) {
+func (p *Provider) SearchTracks(ctx context.Context, query string, limit int) ([]playlist.Track, error) {
 	q := strings.TrimSpace(query)
 	if q == "" {
 		return nil, nil
@@ -107,5 +104,5 @@ func (p *Provider) SearchTracks(_ context.Context, query string, limit int) ([]p
 	if limit <= 0 {
 		limit = 10
 	}
-	return resolve.ResolveYTDLBatch(fmt.Sprintf("scsearch%d:%s", limit, q), 0, 0)
+	return resolve.ResolveYTDLBatchContext(ctx, fmt.Sprintf("scsearch%d:%s", limit, q), 0, 0, "")
 }

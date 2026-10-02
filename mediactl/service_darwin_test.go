@@ -9,7 +9,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
-	"cliamp/internal/playback"
+	"github.com/bjarneo/cliamp/internal/playback"
 )
 
 func TestDarwinCallbacksUseHandleRouting(t *testing.T) {
@@ -90,7 +90,7 @@ func TestDarwinUpdateCoalescesPendingState(t *testing.T) {
 	})
 	svc.Update(playback.State{
 		Status:   playback.StatusPlaying,
-		Track:    playback.Track{Title: "second", Artist: "artist"},
+		Track:    playback.Track{Title: "second", Artist: "artist", ArtURL: "file:///tmp/cover.jpg"},
 		Position: 2250 * time.Millisecond,
 		Seekable: false,
 	})
@@ -100,6 +100,7 @@ func TestDarwinUpdateCoalescesPendingState(t *testing.T) {
 		want := updateReq{
 			title:        "second",
 			artist:       "artist",
+			artURL:       "file:///tmp/cover.jpg",
 			durationSecs: 0,
 			elapsedSecs:  2.25,
 			status:       playback.StatusPlaying,

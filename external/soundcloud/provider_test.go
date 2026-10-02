@@ -2,10 +2,15 @@ package soundcloud
 
 import (
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
-	"cliamp/resolve"
+	"github.com/bjarneo/cliamp/internal/ytdlcookies"
+	"github.com/bjarneo/cliamp/resolve"
 )
 
 func TestNewFromConfig(t *testing.T) {
@@ -115,6 +120,25 @@ func TestSearchTracksEmptyQuery(t *testing.T) {
 	}
 }
 
+func TestSearchTracksHonorsCancellation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping Unix shell script test on Windows")
+	}
+	tmpDir := t.TempDir()
+	fakeYTDL := filepath.Join(tmpDir, "yt-dlp")
+	if err := os.WriteFile(fakeYTDL, []byte("#!/bin/sh\nexec sleep 10\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := NewFromConfig(Config{Enabled: true}).SearchTracks(ctx, "query", 10)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("SearchTracks() error = %v, want context.Canceled", err)
+	}
+}
+
 func TestTracksRejectsEmptyID(t *testing.T) {
 	p := NewFromConfig(Config{Enabled: true})
 	_, err := p.Tracks("")
@@ -133,14 +157,10 @@ func TestConfigIsSet(t *testing.T) {
 }
 
 func TestNewFromConfigPropagatesCookies(t *testing.T) {
-	t.Cleanup(func() { resolve.SetYTDLCookiesFrom("") })
-
-	resolve.SetYTDLCookiesFrom("") // baseline
+	t.Cleanup(func() { resolve.SetYTDLCookiesForHost("soundcloud.com", "") })
 
 	NewFromConfig(Config{Enabled: true, CookiesFrom: "firefox"})
-	// The exported getter is internal; we verify by side effect: a subsequent
-	// resolve call would emit --cookies-from-browser firefox. We can't easily
-	// invoke yt-dlp from a unit test, so the smoke test is that the setter
-	// accepts our value without panic and the constructor succeeds.
-	// (Full plumbing is exercised manually; resolve.ytdlCookiesFrom is private.)
+	if got := ytdlcookies.ForURL("https://soundcloud.com/user/tracks"); got != "firefox" {
+		t.Errorf("SoundCloud cookie source = %q, want firefox", got)
+	}
 }

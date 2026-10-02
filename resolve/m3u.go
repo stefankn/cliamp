@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"cliamp/playlist"
+	"github.com/bjarneo/cliamp/playlist"
 )
 
 // m3uEntry holds a single parsed M3U entry with optional EXTINF metadata.
@@ -93,7 +93,7 @@ func parseM3U(r io.Reader, baseDir string) ([]m3uEntry, error) {
 func m3uEntryToTrack(e m3uEntry) playlist.Track {
 	isURL := playlist.IsURL(e.Path)
 	duration := max(e.Duration, 0)
-	realtime := isURL && e.Duration < 0
+	realtime := isURL && e.Duration <= 0
 
 	if e.Title != "" {
 		return playlist.Track{

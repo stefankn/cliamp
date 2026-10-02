@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"encoding/xml"
 	"fmt"
 	"io"
 	"io/fs"
@@ -21,56 +20,37 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"cliamp/player"
-	"cliamp/playlist"
+	"github.com/bjarneo/cliamp/internal/httpclient"
+	"github.com/bjarneo/cliamp/internal/ytdlcookies"
+	"github.com/bjarneo/cliamp/playlist"
 
 	"github.com/kkdai/youtube/v2"
 )
 
-// ytdlCookiesFromVal stores the browser name passed to yt-dlp's
-// --cookies-from-browser flag. atomic.Value allows lock-free reads on the
-// resolve hot path while permitting late binding from main.go.
-var ytdlCookiesFromVal atomic.Value
+// ExpandYTPlaylist controls whether YouTube (Music) URLs with a list=
+// parameter expand the full playlist or resolve as a single video.
+// Default true preserves backward compatibility.
+var ExpandYTPlaylist = true
 
-// SetYTDLCookiesFrom configures yt-dlp to use cookies from the given browser
-// (e.g. "firefox", "chrome", "brave") for any --flat-playlist resolution.
-// Pass an empty string to disable.
-func SetYTDLCookiesFrom(browser string) {
-	ytdlCookiesFromVal.Store(browser)
+// SetYTDLCookiesForHost configures yt-dlp to use browser cookies when
+// resolving or playing URLs for host. Passing an empty browser disables it.
+func SetYTDLCookiesForHost(host, browser string) {
+	ytdlcookies.SetForHost(host, browser)
 }
 
-func ytdlCookiesFrom() string {
-	v, _ := ytdlCookiesFromVal.Load().(string)
-	return v
-}
-
-// httpClient is used for feed and M3U resolution. It has a generous but
-// finite timeout to prevent hanging on unresponsive servers.
-var httpClient = &http.Client{
-	Timeout:   30 * time.Second,
-	Transport: &uaTransport{rt: http.DefaultTransport},
-}
+// httpClient is used for feed, M3U and YouTube page resolution. It has a
+// generous but finite timeout to prevent hanging on unresponsive servers.
+// httpclient.NewAPI sends the cliamp User-Agent and follows the proxy
+// variables.
+var httpClient = httpclient.NewAPI(30 * time.Second)
 
 // sniffClient probes content types during Args classification, which runs on
 // the startup path before the TUI launches. It uses a short timeout so a slow
 // or unresponsive server can stall startup by at most a few seconds rather
 // than the 30s the feed/M3U client allows.
-var sniffClient = &http.Client{
-	Timeout:   5 * time.Second,
-	Transport: &uaTransport{rt: http.DefaultTransport},
-}
-
-// uaTransport injects the cliamp User-Agent header into every request.
-type uaTransport struct{ rt http.RoundTripper }
-
-func (t *uaTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	req = req.Clone(req.Context())
-	req.Header.Set("User-Agent", "cliamp/1.0 (https://github.com/bjarneo/cliamp)")
-	return t.rt.RoundTrip(req)
-}
+var sniffClient = httpclient.NewAPI(5 * time.Second)
 
 // Result holds the output of Args: instantly-resolved tracks and
 // remote URLs (feeds, M3U) that need async HTTP fetching.
@@ -79,24 +59,71 @@ type Result struct {
 	Pending []string         // feed/M3U URLs to resolve asynchronously
 }
 
+// remoteKind names the resolver that Remote uses for a URL.
+type remoteKind int
+
+const (
+	kindStream remoteKind = iota // no resolver claims the URL: play it as is
+	kindXiaoyuzhou
+	kindYouTubeMusic
+	kindYouTube
+	kindYTDL
+	kindFeed
+	kindM3U
+	kindPLS
+)
+
+// classifyRemote picks the resolver for the URL u from its form alone. It is
+// the one list that both Args and Remote use. The case order matters:
+// IsYTDL also matches YouTube and YouTube Music URLs, and a yt-dlp site wins
+// over a playlist or feed file extension.
+func classifyRemote(u string) remoteKind {
+	switch {
+	case playlist.IsXiaoyuzhouEpisode(u):
+		return kindXiaoyuzhou
+	case playlist.IsYouTubeMusicURL(u):
+		return kindYouTubeMusic
+	case playlist.IsYouTubeURL(u):
+		return kindYouTube
+	case playlist.IsYTDL(u):
+		return kindYTDL
+	case playlist.IsFeed(u):
+		return kindFeed
+	case playlist.IsM3U(u):
+		return kindM3U
+	case playlist.IsPLS(u):
+		return kindPLS
+	}
+	return kindStream
+}
+
 // Args separates CLI arguments into immediately-resolved local tracks
 // and pending remote URLs (feeds, M3U) that require HTTP fetching.
 func Args(args []string) (Result, error) {
+	return argsContext(context.Background(), args)
+}
+
+// argsContext is Args with caller-controlled cancellation of the feed sniff.
+func argsContext(ctx context.Context, args []string) (Result, error) {
 	var r Result
 	var files []string
 
 	for _, arg := range args {
 		if playlist.IsURL(arg) {
-			if playlist.IsFeed(arg) || playlist.IsM3U(arg) || playlist.IsPLS(arg) || playlist.IsYouTubeURL(arg) || playlist.IsYTDL(arg) || playlist.IsXiaoyuzhouEpisode(arg) || sniffFeedURL(arg) {
+			if classifyRemote(arg) != kindStream || sniffFeedURL(ctx, arg) {
 				r.Pending = append(r.Pending, arg)
 			} else {
 				files = append(files, arg)
 			}
 			continue
 		}
-		matches, err := filepath.Glob(arg)
-		if err != nil || len(matches) == 0 {
-			matches = []string{arg}
+		// A path that exists is taken as is. Its brackets or other glob
+		// metacharacters could otherwise match a sibling instead of itself.
+		matches := []string{arg}
+		if _, err := os.Lstat(arg); err != nil {
+			if m, _ := filepath.Glob(arg); len(m) > 0 {
+				matches = m
+			}
 		}
 		for _, path := range matches {
 			if playlist.IsLocalM3U(path) {
@@ -128,57 +155,93 @@ func Args(args []string) (Result, error) {
 }
 
 // Remote fetches feed and M3U URLs and returns the resolved tracks.
+//
+// Callers must pass URLs that have already been classified as remote
+// playlists, as Args does: a URL that classifyRemote reports as kindStream
+// goes to Feed. Use URL for input that has not been classified yet,
+// such as an address typed interactively.
 func Remote(urls []string) ([]playlist.Track, error) {
+	return RemoteContext(context.Background(), urls)
+}
+
+// RemoteContext is Remote with caller-controlled cancellation. ctx covers
+// each fetch and each yt-dlp run.
+func RemoteContext(ctx context.Context, urls []string) ([]playlist.Track, error) {
 	var tracks []playlist.Track
 	for _, u := range urls {
-		switch {
-		case playlist.IsXiaoyuzhouEpisode(u):
-			t, err := resolveXiaoyuzhouEpisode(u)
+		switch classifyRemote(u) {
+		case kindXiaoyuzhou:
+			t, err := resolveXiaoyuzhouEpisode(ctx, u)
 			if err != nil {
 				return nil, fmt.Errorf("resolving xiaoyuzhou episode %s: %w", u, err)
 			}
 			tracks = append(tracks, t...)
-		case playlist.IsYouTubeMusicURL(u):
+		case kindYouTubeMusic:
 			// YouTube Music requires yt-dlp; the native YouTube API client
 			// does not support music.youtube.com playlists.
-			t, err := resolveYTDL(u)
-			if err != nil {
-				return nil, fmt.Errorf("resolving youtube music %s: %w", u, err)
+			//
+			// When the URL has a playlist (list=), fetch only the first
+			// YTDLRadioInitialItems tracks so the UI can start playing
+			// quickly. The UI's incremental batch loader will fetch the
+			// remaining tracks in the background. If the playlist fetch
+			// fails (e.g. auto-generated mix timed out), fall back to
+			// the single video.
+			target := u
+			if !ExpandYTPlaylist {
+				target = stripPlaylistParam(u)
+				t, err := resolveYTDL(ctx, target, 0)
+				if err != nil {
+					return nil, fmt.Errorf("resolving youtube music %s: %w", u, err)
+				}
+				tracks = append(tracks, t...)
+			} else if hasListParam(u) {
+				t, err := resolveYTDL(ctx, target, YTDLRadioInitialItems)
+				if err != nil {
+					target = stripPlaylistParam(u)
+					t, err = resolveYTDL(ctx, target, 0)
+				}
+				if err != nil {
+					return nil, fmt.Errorf("resolving youtube music %s: %w", u, err)
+				}
+				tracks = append(tracks, t...)
+			} else {
+				t, err := resolveYTDL(ctx, target, 0)
+				if err != nil {
+					return nil, fmt.Errorf("resolving youtube music %s: %w", u, err)
+				}
+				tracks = append(tracks, t...)
 			}
-			tracks = append(tracks, t...)
-		case playlist.IsYouTubeURL(u):
-			t, err := resolveYouTube(u)
+		case kindYouTube:
+			target := u
+			if !ExpandYTPlaylist {
+				target = stripPlaylistParam(u)
+			}
+			t, err := resolveYouTube(ctx, target)
 			if err != nil {
 				return nil, fmt.Errorf("resolving youtube %s: %w", u, err)
 			}
 			tracks = append(tracks, t...)
-		case playlist.IsYTDL(u):
-			t, err := resolveYTDL(u)
+		case kindYTDL:
+			t, err := resolveYTDL(ctx, u, 0)
 			if err != nil {
 				return nil, fmt.Errorf("resolving yt-dlp %s: %w", u, err)
 			}
 			tracks = append(tracks, t...)
-		case playlist.IsFeed(u):
-			t, err := resolveFeed(u)
-			if err != nil {
-				return nil, fmt.Errorf("resolving feed %s: %w", u, err)
-			}
-			tracks = append(tracks, t...)
-		case playlist.IsM3U(u):
-			t, err := resolveM3U(u)
+		case kindM3U:
+			t, err := resolveM3U(ctx, u)
 			if err != nil {
 				return nil, fmt.Errorf("resolving m3u %s: %w", u, err)
 			}
 			tracks = append(tracks, t...)
-		case playlist.IsPLS(u):
-			t, err := resolvePLS(u)
+		case kindPLS:
+			t, err := resolvePLS(ctx, u)
 			if err != nil {
 				return nil, fmt.Errorf("resolving pls %s: %w", u, err)
 			}
 			tracks = append(tracks, t...)
 		default:
-			// URL was classified as a feed by content-type sniffing.
-			t, err := resolveFeed(u)
+			// kindFeed, or kindStream that Args sniffed as a feed.
+			t, err := Feed(ctx, u)
 			if err != nil {
 				return nil, fmt.Errorf("resolving feed %s: %w", u, err)
 			}
@@ -188,20 +251,80 @@ func Remote(urls []string) ([]playlist.Track, error) {
 	return tracks, nil
 }
 
-// sniffFeedURL does a HEAD request and returns true if the Content-Type
-// indicates an RSS/Atom feed. Used as a fallback when the URL has no
-// recognizable file extension (e.g. https://feeds.megaphone.fm/GLT1412515089).
-func sniffFeedURL(rawURL string) bool {
+// URL resolves one interactive URL using the same classification as command-line
+// arguments, including raw streams, feeds, remote playlists, and video pages.
+func URL(rawURL string) ([]playlist.Track, error) {
+	return URLContext(context.Background(), rawURL)
+}
+
+// URLContext is URL with caller-controlled cancellation. ctx covers the feed
+// sniff of a URL that no resolver claims, and the fetch of a feed, a remote
+// playlist or a video page. The sniff also keeps its own 5 s limit.
+func URLContext(ctx context.Context, rawURL string) ([]playlist.Track, error) {
+	result, err := argsContext(ctx, []string{rawURL})
+	if err != nil {
+		return nil, err
+	}
+	// A cancelled sniff finds no feed. Stop here, so the URL does not come
+	// back as a plain stream.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	tracks := result.Tracks
+	if len(result.Pending) > 0 {
+		pending, err := RemoteContext(ctx, result.Pending)
+		if err != nil {
+			return nil, err
+		}
+		tracks = append(tracks, pending...)
+	}
+	return tracks, nil
+}
+
+// stripPlaylistParam removes the list= query parameter from a URL, returning
+// the original URL unchanged if no list parameter is present. Used when
+// ExpandYTPlaylist is false to resolve a single video instead of the playlist.
+func stripPlaylistParam(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	q := u.Query()
+	if q.Get("list") == "" {
+		return rawURL
+	}
+	q.Del("list")
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+// hasListParam reports whether the URL contains a non-empty list= query parameter.
+func hasListParam(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	return u.Query().Get("list") != ""
+}
+
+// sniffFeedURL does a HEAD request under ctx and returns true if the
+// Content-Type indicates an RSS/Atom feed. Used as a fallback when the URL has
+// no recognizable file extension (e.g. https://feeds.megaphone.fm/GLT1412515089).
+func sniffFeedURL(ctx context.Context, rawURL string) bool {
 	// URLs with a known audio extension are never feeds — skip the
 	// network round-trip to avoid misclassification when CDNs return
 	// unexpected Content-Types for HEAD requests.
 	if u, err := url.Parse(rawURL); err == nil {
-		if player.SupportedExts[strings.ToLower(filepath.Ext(u.Path))] {
+		if playlist.IsAudioFile(u.Path) {
 			return false
 		}
 	}
 
-	resp, err := sniffClient.Head(rawURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, rawURL, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := sniffClient.Do(req)
 	if err != nil {
 		return false
 	}
@@ -220,34 +343,83 @@ func sniffFeedURL(rawURL string) bool {
 // If path is a directory, it walks it recursively collecting supported files.
 // If path is a file with a supported extension, it returns it directly.
 func CollectAudioFiles(path string) ([]string, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return nil, err
-	}
+	return AudioFiles(path, true)
+}
 
+// AudioFiles returns sorted audio file paths under dir. When recursive is
+// false only the directory's immediate children are considered. A file path
+// with a supported extension is returned directly.
+func AudioFiles(dir string, recursive bool) ([]string, error) {
+	info, err := os.Stat(dir)
+	if err != nil {
+		return nil, fmt.Errorf("stat audio path %q: %w", dir, err)
+	}
 	if !info.IsDir() {
-		if player.SupportedExts[strings.ToLower(filepath.Ext(path))] {
-			return []string{path}, nil
+		if playlist.IsAudioFile(dir) {
+			return []string{dir}, nil
 		}
 		return nil, nil
 	}
 
-	var files []string
-	err = filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
+	if recursive {
+		var files []string
+		err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				// Skip entries we cannot read instead of aborting the scan, so
+				// one unreadable subdirectory cannot empty the whole result.
+				if d != nil && d.IsDir() {
+					return fs.SkipDir
+				}
+				return nil
+			}
+			if !d.IsDir() && playlist.IsAudioFile(p) {
+				files = append(files, p)
+			}
+			return nil
+		})
 		if err != nil {
-			return err
+			return nil, fmt.Errorf("walk audio directory %q: %w", dir, err)
 		}
-		if !d.IsDir() && player.SupportedExts[strings.ToLower(filepath.Ext(p))] {
-			files = append(files, p)
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
+
+		slices.Sort(files)
+		return files, nil
 	}
 
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read audio directory %q: %w", dir, err)
+	}
+	var files []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		p := filepath.Join(dir, e.Name())
+		if playlist.IsAudioFile(p) {
+			files = append(files, p)
+		}
+	}
 	slices.Sort(files)
 	return files, nil
+}
+
+// TracksFromPaths converts file paths to Tracks concurrently with tag
+// reading, preserving order.
+func TracksFromPaths(files []string) []playlist.Track {
+	return scanTracks(files)
+}
+
+// LocalPlaylist resolves a local M3U/M3U8 or PLS playlist file into tracks.
+// Relative paths are resolved by the underlying parser against the playlist
+// file's directory, matching normal playback import behavior.
+func LocalPlaylist(path string) ([]playlist.Track, error) {
+	if playlist.IsLocalM3U(path) {
+		return resolveLocalM3U(path)
+	}
+	if playlist.IsLocalPLS(path) {
+		return resolveLocalPLS(path)
+	}
+	return nil, fmt.Errorf("unsupported playlist file %q", path)
 }
 
 // scanTracks converts file paths to Tracks concurrently, preserving order.
@@ -276,63 +448,30 @@ func scanTracks(files []string) []playlist.Track {
 	return tracks
 }
 
-// resolveFeed fetches a podcast RSS feed and returns tracks with metadata.
-func resolveFeed(feedURL string) ([]playlist.Track, error) {
-	resp, err := httpClient.Get(feedURL)
+// httpGet sends a GET request for rawURL with httpClient under ctx.
+func httpGet(ctx context.Context, rawURL string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("http status %s", resp.Status)
-	}
-
-	var rss struct {
-		Channel struct {
-			Title string `xml:"title"`
-			Items []struct {
-				Title     string `xml:"title"`
-				Duration  string `xml:"http://www.itunes.com/dtds/podcast-1.0.dtd duration"`
-				Enclosure struct {
-					URL  string `xml:"url,attr"`
-					Type string `xml:"type,attr"`
-				} `xml:"enclosure"`
-			} `xml:"item"`
-		} `xml:"channel"`
-	}
-	// Bound the read so a huge or malicious feed can't exhaust memory.
-	const maxFeedBody = 32 << 20 // 32 MB
-	if err := xml.NewDecoder(io.LimitReader(resp.Body, maxFeedBody)).Decode(&rss); err != nil {
-		return nil, fmt.Errorf("parsing feed: %w", err)
-	}
-
-	var tracks []playlist.Track
-	for _, item := range rss.Channel.Items {
-		if item.Enclosure.URL == "" {
-			continue
-		}
-		tracks = append(tracks, playlist.Track{
-			Path:         item.Enclosure.URL,
-			Title:        item.Title,
-			Artist:       rss.Channel.Title,
-			Stream:       true,
-			DurationSecs: parseItunesDuration(item.Duration),
-		})
-	}
-	return tracks, nil
+	return httpClient.Do(req)
 }
 
-// maxM3UBody caps how much of a remote playlist we read before classifying it.
-// HLS/M3U playlists are tiny (a few KB); 1 MB is a generous safety bound.
-const maxM3UBody = 1 << 20
+// maxPlaylistBody caps how much of a remote playlist we read before
+// classifying it. HLS/M3U and PLS playlists are tiny (a few KB); 1 MB is a
+// generous safety bound.
+const maxPlaylistBody = 1 << 20
+
+// maxHLSScan caps how much of an HLS body past maxPlaylistBody
+// hasHLSEndList reads to find #EXT-X-ENDLIST.
+const maxHLSScan = 16 << 20
 
 // resolveM3U fetches an M3U/M3U8 URL. HLS playlists (master or media) are a
 // single live/VOD stream — not a track list — so the original URL is handed to
 // the player, where ffmpeg resolves the relative chunklist/segment URIs and
 // follows the live segment window. Plain M3U files are parsed as track lists.
-func resolveM3U(m3uURL string) ([]playlist.Track, error) {
-	resp, err := httpClient.Get(m3uURL)
+func resolveM3U(ctx context.Context, m3uURL string) ([]playlist.Track, error) {
+	resp, err := httpGet(ctx, m3uURL)
 	if err != nil {
 		return nil, err
 	}
@@ -342,7 +481,11 @@ func resolveM3U(m3uURL string) ([]playlist.Track, error) {
 		return nil, fmt.Errorf("http status %s", resp.Status)
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxM3UBody))
+	// Read one byte past the cap so that an oversized plain M3U is reported,
+	// as in resolvePLS. An HLS body only decides the stream type, and a long
+	// VOD media playlist can pass the cap, so an HLS body over the cap still
+	// plays.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxPlaylistBody+1))
 	if err != nil {
 		return nil, err
 	}
@@ -354,20 +497,23 @@ func resolveM3U(m3uURL string) ([]playlist.Track, error) {
 		t := playlist.TrackFromPath(m3uURL) // Stream=true; title derived from URL
 		// #EXT-X-ENDLIST only appears in media playlists, so VOD behind a
 		// master playlist is conservatively treated as live.
-		t.Realtime = !bytes.Contains(body, []byte("#EXT-X-ENDLIST"))
+		t.Realtime = !hasHLSEndList(body, resp.Body)
 		return []playlist.Track{t}, nil
 	}
 
+	if len(body) > maxPlaylistBody {
+		return nil, fmt.Errorf("m3u playlist exceeds %d bytes", maxPlaylistBody)
+	}
 	entries, err := parseM3U(bytes.NewReader(body), "")
 	if err != nil {
 		return nil, err
 	}
-	return entriesToTracks(entries), nil
+	return filterRemoteEntries(entriesToTracks(entries)), nil
 }
 
 // resolvePLS fetches a PLS playlist URL and returns tracks.
-func resolvePLS(plsURL string) ([]playlist.Track, error) {
-	resp, err := httpClient.Get(plsURL)
+func resolvePLS(ctx context.Context, plsURL string) ([]playlist.Track, error) {
+	resp, err := httpGet(ctx, plsURL)
 	if err != nil {
 		return nil, err
 	}
@@ -377,11 +523,50 @@ func resolvePLS(plsURL string) ([]playlist.Track, error) {
 		return nil, fmt.Errorf("http status %s", resp.Status)
 	}
 
-	entries, err := parsePLS(resp.Body)
+	// Read one byte past the cap so an oversized playlist is reported rather
+	// than silently truncated: io.LimitReader alone would cut mid-line and
+	// hand parsePLS a partial "FileN=https:/", which becomes a bogus track.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxPlaylistBody+1))
+	if err != nil {
+		return nil, fmt.Errorf("reading pls playlist: %w", err)
+	}
+	if len(body) > maxPlaylistBody {
+		return nil, fmt.Errorf("pls playlist exceeds %d bytes", maxPlaylistBody)
+	}
+
+	entries, err := parsePLS(bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
-	return plsEntriesToTracks(entries), nil
+	return filterRemoteEntries(plsEntriesToTracks(entries)), nil
+}
+
+// hasHLSEndList reports whether an HLS body holds #EXT-X-ENDLIST. head is the
+// part of the body already read, and rest is the unread part. A long VOD
+// media playlist puts the tag past maxPlaylistBody, so the check reads up to
+// maxHLSScan bytes of rest in chunks and does not keep them. A read error
+// ends the scan, and the stream then counts as live.
+func hasHLSEndList(head []byte, rest io.Reader) bool {
+	tag := []byte("#EXT-X-ENDLIST")
+	if bytes.Contains(head, tag) {
+		return true
+	}
+	// buf starts with the last len(tag)-1 bytes read so far, so a tag split
+	// across two reads is found.
+	buf := make([]byte, len(tag)-1+32<<10)
+	carry := copy(buf, head[max(0, len(head)-len(tag)+1):])
+	rest = io.LimitReader(rest, maxHLSScan)
+	for {
+		n, err := rest.Read(buf[carry:])
+		window := buf[:carry+n]
+		if bytes.Contains(window, tag) {
+			return true
+		}
+		if err != nil {
+			return false
+		}
+		carry = copy(buf, window[max(0, len(window)-len(tag)+1):])
+	}
 }
 
 // isHLSPlaylist reports whether an M3U body is an HLS playlist (master or media)
@@ -401,6 +586,7 @@ type ytdlFlatEntry struct {
 	PlaylistUploader   string  `json:"playlist_uploader"`
 	WebpageURLBasename string  `json:"webpage_url_basename"`
 	Duration           float64 `json:"duration"`
+	LiveStatus         string  `json:"live_status"` // "is_live" for streams that are live now
 }
 
 // ytdlFullEntry holds JSON fields from yt-dlp --print-json output (download mode).
@@ -418,8 +604,9 @@ const YTDLRadioInitialItems = 20
 // resolveYouTube uses the kkdai/youtube library to resolve YouTube URLs.
 // For playlist URLs it enumerates all entries natively; for single video URLs
 // it returns a single track with metadata from the YouTube API.
-func resolveYouTube(pageURL string) ([]playlist.Track, error) {
-	client := youtube.Client{}
+func resolveYouTube(ctx context.Context, pageURL string) ([]playlist.Track, error) {
+	// The library sets its own User-Agent on each request.
+	client := youtube.Client{HTTPClient: httpClient}
 
 	// Only attempt playlist resolution if the URL contains a "list=" parameter,
 	// avoiding a wasted API call for single-video URLs (the common case).
@@ -433,13 +620,13 @@ func resolveYouTube(pageURL string) ([]playlist.Track, error) {
 		listID = u.Query().Get("list")
 	}
 	if isList && strings.HasPrefix(listID, "RD") {
-		if tracks, err := resolveYTDL(pageURL, YTDLRadioInitialItems); err == nil && len(tracks) > 0 {
+		if tracks, err := resolveYTDL(ctx, pageURL, YTDLRadioInitialItems); err == nil && len(tracks) > 0 {
 			return tracks, nil
 		}
 	}
 
 	if isList {
-		pl, err := client.GetPlaylist(pageURL)
+		pl, err := client.GetPlaylistContext(ctx, pageURL)
 		if err == nil && len(pl.Videos) > 0 {
 			tracks := make([]playlist.Track, 0, len(pl.Videos))
 			for _, entry := range pl.Videos {
@@ -455,13 +642,13 @@ func resolveYouTube(pageURL string) ([]playlist.Track, error) {
 		}
 		// Native library failed (e.g. YouTube Radio/Mix playlists are dynamic
 		// and unsupported). Fall back to yt-dlp which handles them.
-		if tracks, err := resolveYTDL(pageURL); err == nil && len(tracks) > 0 {
+		if tracks, err := resolveYTDL(ctx, pageURL, 0); err == nil && len(tracks) > 0 {
 			return tracks, nil
 		}
 	}
 
 	// Single video.
-	video, err := client.GetVideo(pageURL)
+	video, err := client.GetVideoContext(ctx, pageURL)
 	if err != nil {
 		return nil, fmt.Errorf("youtube resolve: %w", err)
 	}
@@ -475,65 +662,84 @@ func resolveYouTube(pageURL string) ([]playlist.Track, error) {
 	}}, nil
 }
 
-// ResolveYTDLBatch is like resolveYTDL but fetches a specific range
-// [start, start+count) from the playlist. Exported for UI incremental loading.
-// ResolveYTDLBatch fetches tracks starting at offset `start`.
-// If count > 0, fetches at most `count` items; if count == 0, fetches all remaining.
-func ResolveYTDLBatch(pageURL string, start, count int) ([]playlist.Track, error) {
-	end := 0
-	if count > 0 {
-		end = start + count
-	}
-	return resolveYTDLRange(pageURL, start, end)
-}
+// ytdlTimeout bounds one yt-dlp enumeration when the caller sets no limit.
+const ytdlTimeout = 30 * time.Second
 
-// resolveYTDL uses yt-dlp --flat-playlist to quickly enumerate tracks.
-// Tracks are returned with their page URLs as Path (not direct audio URLs).
-// If maxItems > 0, only the first maxItems tracks are fetched.
-func resolveYTDL(pageURL string, maxItems ...int) ([]playlist.Track, error) {
-	end := 0
-	if len(maxItems) > 0 {
-		end = maxItems[0]
-	}
-	return resolveYTDLRange(pageURL, 0, end)
-}
-
-func resolveYTDLRange(pageURL string, start, end int) ([]playlist.Track, error) {
-	if _, err := exec.LookPath("yt-dlp"); err != nil {
-		return nil, fmt.Errorf("yt-dlp not found in PATH — see https://github.com/yt-dlp/yt-dlp#installation")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+// ResolveYTDLBatch is ResolveYTDLBatchContext with a 30 s limit.
+func ResolveYTDLBatch(pageURL string, start, count int, browser string) ([]playlist.Track, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), ytdlTimeout)
 	defer cancel()
+	return ResolveYTDLBatchContext(ctx, pageURL, start, count, browser)
+}
+
+// ResolveYTDLBatchContext is ResolveYTDLBatchPageContext without the count of
+// source entries.
+func ResolveYTDLBatchContext(ctx context.Context, pageURL string, start, count int, browser string) ([]playlist.Track, error) {
+	tracks, _, err := ResolveYTDLBatchPageContext(ctx, pageURL, start, count, browser)
+	return tracks, err
+}
+
+// ResolveYTDLBatchPageContext uses yt-dlp --flat-playlist to list the entries
+// of pageURL from offset start. It fetches at most count entries, or all the
+// remaining entries when count is 0. The tracks keep their page URLs as Path,
+// not direct audio URLs. It also returns the number of source entries that
+// yt-dlp emitted, which includes entries that give no track. A non-empty
+// browser supplies the cookies. Otherwise the cookie source configured for the
+// host of pageURL applies.
+func ResolveYTDLBatchPageContext(ctx context.Context, pageURL string, start, count int, browser string) ([]playlist.Track, int, error) {
+	if _, err := exec.LookPath("yt-dlp"); err != nil {
+		return nil, 0, fmt.Errorf("yt-dlp not found in PATH — see https://github.com/yt-dlp/yt-dlp#installation")
+	}
 
 	args := []string{"--flat-playlist", "-j", "--socket-timeout", "15"}
-	if browser := ytdlCookiesFrom(); browser != "" {
-		args = append(args, "--cookies-from-browser", browser)
+	b := strings.TrimSpace(browser)
+	if b == "" {
+		b = ytdlcookies.ForURL(pageURL)
+	}
+	if b != "" {
+		args = append(args, "--cookies-from-browser", b)
 	}
 	if start > 0 {
 		args = append(args, "--playlist-start", strconv.Itoa(start+1)) // yt-dlp is 1-based
 	}
+	end := 0
+	if count > 0 {
+		end = start + count
+	}
 	if end > 0 {
 		args = append(args, "--playlist-end", strconv.Itoa(end))
 	}
-	args = append(args, pageURL)
+	args = append(args, "--", pageURL)
 	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
+	cmd.WaitDelay = 3 * time.Second
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	stdout, err := cmd.Output()
 	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, fmt.Errorf("yt-dlp: timed out resolving %s (30s)", pageURL)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, 0, fmt.Errorf("yt-dlp: resolve %s: %w", pageURL, ctxErr)
 		}
 		msg := strings.TrimSpace(stderr.String())
 		if msg != "" {
-			return nil, fmt.Errorf("yt-dlp: %s", msg)
+			return nil, 0, fmt.Errorf("yt-dlp: %s", msg)
 		}
-		return nil, fmt.Errorf("yt-dlp: %w", err)
+		return nil, 0, fmt.Errorf("yt-dlp: %w", err)
 	}
+	return parseYTDLTracks(bytes.NewReader(stdout))
+}
 
+// resolveYTDL lists the first maxItems entries of pageURL, or all entries when
+// maxItems is 0. Each call gets its own 30 s limit under ctx.
+func resolveYTDL(ctx context.Context, pageURL string, maxItems int) ([]playlist.Track, error) {
+	ctx, cancel := context.WithTimeout(ctx, ytdlTimeout)
+	defer cancel()
+	return ResolveYTDLBatchContext(ctx, pageURL, 0, maxItems, "")
+}
+
+func parseYTDLTracks(r io.Reader) ([]playlist.Track, int, error) {
 	var tracks []playlist.Track
-	scanner := bufio.NewScanner(strings.NewReader(string(stdout)))
+	entries := 0
+	scanner := bufio.NewScanner(r)
 	// yt-dlp JSON can exceed bufio.Scanner's default 64KB token limit
 	// (e.g. videos with very long descriptions).
 	scanner.Buffer(make([]byte, 0, scannerInitBufSize), scannerMaxLineSize)
@@ -542,6 +748,7 @@ func resolveYTDLRange(pageURL string, start, end int) ([]playlist.Track, error) 
 		if line == "" {
 			continue
 		}
+		entries++
 		var e ytdlFlatEntry
 		if err := json.Unmarshal([]byte(line), &e); err != nil {
 			continue
@@ -569,30 +776,41 @@ func resolveYTDLRange(pageURL string, start, end int) ([]playlist.Track, error) 
 			Title:        title,
 			Artist:       artist,
 			Stream:       true,
+			Realtime:     e.LiveStatus == "is_live",
 			DurationSecs: int(e.Duration),
 		})
 	}
-	return tracks, scanner.Err()
+	return tracks, entries, scanner.Err()
 }
 
-// DownloadYTDL downloads a single track via yt-dlp to the given directory
-// and returns the output file path. Uses yt-dlp's default naming template.
-func DownloadYTDL(pageURL, saveDir string) (string, error) {
+// DownloadYTDLContext downloads a single track via yt-dlp to saveDir and
+// returns the output file path. A cancel of ctx stops yt-dlp. It sets no time
+// limit of its own, because a download can take minutes.
+func DownloadYTDLContext(ctx context.Context, pageURL, saveDir string) (string, error) {
 	if _, err := exec.LookPath("yt-dlp"); err != nil {
 		return "", fmt.Errorf("yt-dlp not found in PATH")
 	}
 
 	outTemplate := filepath.Join(saveDir, "%(artist,uploader)s - %(title)s.%(ext)s")
-	cmd := exec.Command("yt-dlp",
+	args := []string{
 		"-f", "bestaudio[protocol=https]/bestaudio[protocol=http]/bestaudio",
 		"--no-playlist",
 		"--print-json",
 		"-o", outTemplate,
-		pageURL)
+	}
+	if browser := ytdlcookies.ForURL(pageURL); browser != "" {
+		args = append(args, "--cookies-from-browser", browser)
+	}
+	args = append(args, "--", pageURL)
+	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
+	cmd.WaitDelay = 3 * time.Second
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	stdout, err := cmd.Output()
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", fmt.Errorf("yt-dlp: download %s: %w", pageURL, ctxErr)
+		}
 		msg := strings.TrimSpace(stderr.String())
 		if msg != "" {
 			return "", fmt.Errorf("yt-dlp: %s", msg)
@@ -661,8 +879,8 @@ func parseItunesDuration(s string) int {
 // A trailing known audio extension (e.g. "track.mp3") is dropped so it doesn't
 // leak into the title; non-media suffixes (e.g. "3.5-remix") are left intact.
 func humanizeBasename(s string) string {
-	if ext := filepath.Ext(s); ext != "" && player.SupportedExts[strings.ToLower(ext)] {
-		s = strings.TrimSuffix(s, ext)
+	if playlist.IsAudioFile(s) {
+		s = strings.TrimSuffix(s, filepath.Ext(s))
 	}
 	return strings.ReplaceAll(s, "-", " ")
 }

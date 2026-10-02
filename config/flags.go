@@ -15,11 +15,14 @@ type Overrides struct {
 	ResampleQuality *int
 	BitDepth        *int
 	Play            *bool
-	Compact         *bool
+	Simplified      *bool
+	HideHelpBar     *bool
+	Expanded        *bool
 	AudioDevice     *string
 	Playlist        *string
 	LogLevel        *string
 	LowPower        *bool
+	ExpandPlaylist  *bool
 }
 
 // Apply merges non-nil overrides into cfg and clamps the result.
@@ -60,8 +63,14 @@ func (o Overrides) Apply(cfg *Config) {
 	if o.BitDepth != nil {
 		cfg.BitDepth = *o.BitDepth
 	}
-	if o.Compact != nil {
-		cfg.Compact = *o.Compact
+	if o.Simplified != nil {
+		cfg.Simplified = *o.Simplified
+	}
+	if o.HideHelpBar != nil {
+		cfg.HideHelpBar = *o.HideHelpBar
+	}
+	if o.Expanded != nil {
+		cfg.Expanded = *o.Expanded
 	}
 	if o.Play != nil {
 		cfg.AutoPlay = *o.Play
@@ -77,6 +86,9 @@ func (o Overrides) Apply(cfg *Config) {
 	}
 	if o.LowPower != nil {
 		cfg.LowPower = *o.LowPower
+	}
+	if o.ExpandPlaylist != nil {
+		cfg.YouTubeMusic.ExpandPlaylist = o.ExpandPlaylist
 	}
 	cfg.clamp()
 }

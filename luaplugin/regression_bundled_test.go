@@ -3,7 +3,10 @@ package luaplugin
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/bjarneo/cliamp/internal/plugintrust"
 )
 
 // TestBundledPluginsLoad is the backward-compatibility guard for the plugin
@@ -45,9 +48,13 @@ func TestBundledPluginsLoad(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(pluginDir, name), data, 0o644); err != nil {
 			t.Fatalf("copy %s: %v", name, err)
 		}
+		pluginName := strings.TrimSuffix(name, ".lua")
+		if _, err := plugintrust.Approve(pluginDir, pluginName, filepath.Join(pluginDir, name)); err != nil {
+			t.Fatalf("approve %s: %v", name, err)
+		}
 	}
 
-	mgr, err := New(nil)
+	mgr, err := New(nil, nil, nil)
 	if err != nil {
 		t.Fatalf("bundled plugins failed to load (API compatibility broken): %v", err)
 	}

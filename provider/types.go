@@ -5,6 +5,20 @@
 // via type assertions.
 package provider
 
+import (
+	"strconv"
+
+	"github.com/bjarneo/cliamp/playlist"
+)
+
+// Entry pairs a display name with a key and provider implementation. The
+// provider list of the UI is a slice of entries in display order.
+type Entry struct {
+	Key      string            // config key: "radio", "navidrome", "spotify"
+	Name     string            // display name: "Radio", "Navidrome", "Spotify"
+	Provider playlist.Provider // nil if not configured
+}
+
 // ArtistInfo describes an artist in a provider's catalog.
 type ArtistInfo struct {
 	ID         string
@@ -21,6 +35,18 @@ type AlbumInfo struct {
 	Year       int
 	TrackCount int
 	Genre      string
+	// Restricted is presentation metadata for provider items that may require
+	// account access. It must not be folded into Name or persisted metadata.
+	Restricted bool
+}
+
+// GenreInfo describes a provider category and whether it is pinned as a
+// favorite. Group is optional (for example "Music" or "Talk").
+type GenreInfo struct {
+	ID       string
+	Name     string
+	Group    string
+	Favorite bool
 }
 
 // SortType describes one sort option for album listing.
@@ -29,10 +55,46 @@ type SortType struct {
 	Label string // e.g. "By Name"
 }
 
+// YearFromDate extracts the year from a "YYYY-MM-DD" (or bare "YYYY") date
+// string, as returned by streaming-service APIs. Returns 0 when the string
+// does not start with a 4-digit year.
+func YearFromDate(date string) int {
+	if len(date) < 4 {
+		return 0
+	}
+	y, err := strconv.Atoi(date[:4])
+	if err != nil {
+		return 0
+	}
+	return y
+}
+
 // ProviderMeta key constants used across providers and the UI.
 const (
 	MetaNavidromeID = "navidrome.id"
 	MetaJellyfinID  = "jellyfin.id"
 	MetaEmbyID      = "emby.id"
 	MetaNetEaseID   = "netease.id"
+	MetaYandexID    = "yandex.id"
+	MetaQobuzID     = "qobuz.id"
+	MetaTidalID     = "tidal.id"
+	MetaLyrionID    = "lyrion.id"
+	MetaMixcloudKey = "mixcloud.key"
+	// MetaMixcloudCreator is the profile username that owns a Mixcloud show.
+	MetaMixcloudCreator = "mixcloud.creator"
+
+	MetaAudiobookshelfID      = "audiobookshelf.id"
+	MetaAudiobookshelfEpisode = "audiobookshelf.episode"
+	MetaAudiobookshelfOffset  = "audiobookshelf.offset"
+	MetaAudiobookshelfTotal   = "audiobookshelf.total"
+
+	// MetaPodcastFeed is the RSS feed URL an episode came from, and marks a
+	// track as a podcast episode.
+	MetaPodcastFeed = "podcast.feed"
+	// MetaPodcastGUID is the episode's RSS GUID, falling back to its audio
+	// URL when the feed omits one. It identifies an episode across feed
+	// reloads, so listening state is keyed on it.
+	MetaPodcastGUID = "podcast.guid"
+	// MetaPodcastPublished is the episode publication date as YYYY-MM-DD.
+	MetaPodcastPublished = "podcast.published"
 )

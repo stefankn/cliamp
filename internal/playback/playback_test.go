@@ -52,6 +52,7 @@ func TestStateFields(t *testing.T) {
 			Genre:       "Rock",
 			TrackNumber: 3,
 			URL:         "file:///song.mp3",
+			ArtURL:      "file:///cover.jpg",
 			Duration:    3 * time.Minute,
 		},
 		VolumeDB: -3.0,

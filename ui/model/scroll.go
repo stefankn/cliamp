@@ -1,12 +1,6 @@
 package model
 
-import (
-	"strings"
-
-	"charm.land/lipgloss/v2"
-
-	"cliamp/ui"
-)
+import "github.com/bjarneo/cliamp/playlist"
 
 // clampScroll keeps cursor inside [0, count) and adjusts scroll so that
 // the cursor sits within the visible window of `visible` rows.
@@ -33,38 +27,45 @@ func clampScroll(cursor, scroll *int, count, visible int) {
 	}
 }
 
-// measurePlVisible calculates playlist lines available for a given upper limit.
-func (m *Model) measurePlVisible(limit int) int {
-	saved := m.plVisible
-	m.plVisible = 3 // temporary minimal value for measurement
-	defer func() { m.plVisible = saved }()
-
-	// Use mainSections to get all fixed chrome plus any active transient messages.
-	probe := strings.Join(m.mainSections("x", true), "\n")
-	fixedLines := lipgloss.Height(ui.FrameStyle.Render(probe)) - 1
-	return max(3, min(limit, m.height-fixedLines))
-}
-
-// collapsedPlVisible returns the natural (non-expanded) playlist height.
-func (m *Model) collapsedPlVisible() int {
-	return m.measurePlVisible(maxPlVisible)
-}
-
-// expandedPlVisible returns the expanded playlist height with no cap.
-func (m *Model) expandedPlVisible() int {
-	return m.measurePlVisible(m.height)
+// stepListCursor moves cursor for the list navigation keys: up and down
+// wrap, page up and page down move by page rows, and home and end jump to the
+// ends. count is the row count. It returns false for any other key.
+func stepListCursor(key string, cursor *int, count, page int) bool {
+	switch key {
+	case "up", "k":
+		if *cursor > 0 {
+			*cursor--
+		} else if count > 0 {
+			*cursor = count - 1
+		}
+	case "down", "j":
+		if *cursor < count-1 {
+			*cursor++
+		} else if count > 0 {
+			*cursor = 0
+		}
+	case "pgup", "ctrl+u":
+		*cursor -= min(max(0, *cursor), page)
+	case "pgdown", "ctrl+d":
+		if *cursor < count-1 {
+			*cursor = min(count-1, *cursor+page)
+		}
+	case "home", "g":
+		*cursor = 0
+	case "end", "G":
+		if count > 0 {
+			*cursor = count - 1
+		}
+	default:
+		return false
+	}
+	return true
 }
 
 // applyHeightMode sets plVisible based on the current heightExpanded state.
 func (m *Model) applyHeightMode() {
-	if m.playlist == nil {
-		return
-	}
-	if m.heightExpanded {
-		m.plVisible = m.expandedPlVisible()
-	} else {
-		m.plVisible = m.collapsedPlVisible()
-	}
+	m.recomputeLayout()
+	m.normalizeMainFocus()
 }
 
 // adjustScroll ensures plCursor is visible in the playlist view.
@@ -74,8 +75,7 @@ func (m *Model) adjustScroll() {
 	if m.playlist == nil {
 		return
 	}
-	tracks := m.playlist.Tracks()
-	if len(tracks) == 0 {
+	if m.playlist.Len() == 0 {
 		return
 	}
 	visible := m.effectivePlaylistVisible()
@@ -86,65 +86,124 @@ func (m *Model) adjustScroll() {
 }
 
 func (m Model) playlistScroll(visible int) int {
-	tracks := m.playlist.Tracks()
+	count := m.playlist.Len()
+	if count == 0 {
+		return 0
+	}
 	scroll := max(0, m.plScroll)
-	if scroll >= len(tracks) {
-		scroll = max(0, len(tracks)-1)
+	if scroll >= count {
+		scroll = count - 1
 	}
-	if m.plCursor < scroll {
-		return m.plCursor
+	cursor := min(max(0, m.plCursorRow()), count-1)
+	if cursor < scroll {
+		return cursor
 	}
-	for scroll < m.plCursor && m.albumSeparatorRows(tracks, scroll, m.plCursor, m.showAlbumHeaders) > visible {
+	if visible <= 0 {
+		return cursor
+	}
+	if !m.showAlbumHeaders {
+		if cursor-scroll >= visible {
+			return cursor - visible + 1
+		}
+		return scroll
+	}
+
+	// Every track consumes at least one row, so no earlier position can keep
+	// the cursor visible. Include one lookback track for sticky album headers.
+	scroll = max(scroll, cursor-visible+1)
+	start := max(0, scroll-1)
+	_, tracks := m.playlist.OrderWindow(start, cursor-start+1)
+	return start + m.fitHeaderScroll(tracks, scroll-start, cursor-start, visible, m.showAlbumHeaders)
+}
+
+// fitHeaderScroll moves scroll down until the rows from scroll through cursor
+// fit in visible rows. The album headers of tracks count as rows.
+func (m Model) fitHeaderScroll(tracks []playlist.Track, scroll, cursor, visible int, showHeaders bool) int {
+	for scroll < cursor && m.albumSeparatorRows(tracks, scroll, cursor, showHeaders) > visible {
 		scroll++
 	}
 	return scroll
 }
 
 func (m Model) mainFrameFixedLines(includeTransient bool) int {
-	if m.chromeOK {
-		if !includeTransient {
-			return m.chromeHeight
-		}
-		transientLines := len(m.footerMessages())
-		if m.err != nil {
-			transientLines++
-		}
-		return m.chromeHeight + transientLines
+	fixed := 2*m.layout.paddingV + m.layout.fixedRows
+	if includeTransient {
+		fixed += m.layout.footerRows
 	}
-	// Fallback: render and measure (only needed until first WindowSizeMsg)
-	content := strings.Join(m.mainSections("", includeTransient), "\n")
-	return lipgloss.Height(ui.FrameStyle.Render(content))
+	return fixed
 }
 
 func (m Model) effectivePlaylistVisible() int {
-	available := m.height - m.mainFrameFixedLines(true)
-	if available <= 0 {
+	if m.layout.frameWidth == 0 {
+		if m.plVisible > 0 {
+			return m.plVisible
+		}
 		return 0
 	}
-	if m.plVisible <= 0 {
+	if m.layout.tooSmall() || m.layout.bodyRows <= 0 {
 		return 0
 	}
-	return min(m.plVisible, available)
-}
-
-// recomputeChrome renders the fixed chrome (without playlist or transients)
-// and caches its height. Called when terminal width or compact mode changes.
-func (m *Model) recomputeChrome() {
-	content := strings.Join(m.mainSections("", false), "\n")
-	m.chromeHeight = lipgloss.Height(ui.FrameStyle.Render(content))
-	m.chromeOK = true
-}
-
-// invalidateChrome marks the chrome height dirty. Until the next recompute,
-// mainFrameFixedLines falls back to direct measurement.
-func (m *Model) invalidateChrome() {
-	m.chromeOK = false
+	return min(m.plVisible, m.layout.bodyRows)
 }
 
 func (m *Model) refreshChrome() {
-	if m.width > 0 {
-		m.recomputeChrome()
+	m.recomputeLayout()
+}
+
+func (m *Model) clampActiveScrollState() {
+	if m.layout.tooSmall() {
 		return
 	}
-	m.invalidateChrome()
+	switch m.activeScreen() {
+	case screenKeymap:
+		m.keymapMaybeAdjustScroll(m.effectivePlaylistVisible())
+	case screenThemePicker:
+		m.themePickerMaybeAdjustScroll(m.effectivePlaylistVisible())
+	case screenVisPicker:
+		m.visPickerMaybeAdjustScroll(m.effectivePlaylistVisible())
+	case screenDevicePicker:
+		clampScroll(&m.devicePicker.cursor, &m.devicePicker.scroll, len(m.devicePicker.devices), m.effectivePlaylistVisible())
+	case screenPlaylistPicker:
+		m.plPickerMaybeAdjustScroll(m.plPickerVisible())
+	case screenFileBrowser:
+		m.fbMaybeAdjustScroll(m.fbVisible())
+	case screenNavBrowser:
+		m.navMaybeAdjustScroll()
+	case screenPlaylistManager:
+		if m.plManager.screen == plMgrScreenList {
+			m.plMgrListMaybeAdjustScroll(m.effectivePlaylistVisible())
+		} else if m.plManager.screen == plMgrScreenTracks {
+			m.plMgrTracksMaybeAdjustScroll(m.effectivePlaylistVisible())
+		} else if m.plManager.screen == plMgrScreenDirs {
+			m.plMgrDirsMaybeAdjustScroll(m.effectivePlaylistVisible())
+		}
+	case screenSearchOverlay:
+		if m.searchOverlay.screen == searchOverlayResults {
+			m.searchOverlayResultsMaybeAdjustScroll(m.searchOverlayResultsVisible())
+		} else if m.searchOverlay.screen == searchOverlayPlaylist {
+			m.searchOverlayPlaylistMaybeAdjustScroll(m.effectivePlaylistVisible())
+		}
+	case screenQueue:
+		m.normalizeQueueOverlay()
+	case screenInfo:
+		m.infoMaybeAdjustScroll()
+	case screenSearch:
+		m.searchMaybeAdjustScroll(m.effectivePlaylistVisible())
+	case screenNetSearch:
+		if m.netSearch.screen == netSearchResults {
+			m.netSearchResultsMaybeAdjustScroll(m.effectivePlaylistVisible())
+		}
+	case screenLyrics:
+		m.lyrics.scroll = min(m.lyrics.scroll, max(0, len(m.lyrics.lines)-m.effectivePlaylistVisible()))
+	default:
+		// The provider filter shows only in the provider pane.
+		switch {
+		case m.focus == focusProvider && m.provSearch.active:
+			m.provSearchMaybeAdjustScroll()
+		case m.focus == focusProvider:
+			m.providerMaybeAdjustScroll()
+		default:
+			m.adjustScroll()
+		}
+	}
 }

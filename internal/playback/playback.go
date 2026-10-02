@@ -15,6 +15,10 @@ type (
 		Position time.Duration
 	}
 	SetVolumeMsg struct{ VolumeDB float64 }
+	SetSpeedMsg  struct{ Ratio float64 }
+	// ToggleMonoMsg flips mono output. It toggles and does not set a value,
+	// so two toggles that a sender queues before Update runs cancel out.
+	ToggleMonoMsg struct{}
 )
 
 type Status string
@@ -32,15 +36,17 @@ type Track struct {
 	Genre       string
 	TrackNumber int
 	URL         string
+	ArtURL      string
 	Duration    time.Duration
 }
 
 type State struct {
-	Status   Status
-	Track    Track
-	VolumeDB float64
-	Position time.Duration
-	Seekable bool
+	Status      Status
+	Track       Track
+	VolumeDB    float64
+	VolumeMinDB float64 // engine volume floor in dB
+	Position    time.Duration
+	Seekable    bool
 }
 
 type Notifier interface {

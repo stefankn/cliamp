@@ -1,6 +1,10 @@
 package spotify
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"testing"
+)
 
 // TestSpotifyTrackPageSizeRespectsAPILimit asserts spotifyTrackPageSize stays
 // within the Spotify Web API's silent 50-item cap; see the constant's comment
@@ -100,39 +104,71 @@ func TestTrackFromItem(t *testing.T) {
 	})
 }
 
-// TestPlaylistAccessible verifies the visibility filter that hides playlists
-// the current Spotify user can't list tracks for (would otherwise return 403).
-func TestPlaylistAccessible(t *testing.T) {
-	const me = "user123"
-
+func TestAlbumFromItemYear(t *testing.T) {
 	tests := []struct {
-		name          string
-		ownerID       string
-		collaborative bool
-		userID        string
-		want          bool
+		releaseDate string
+		want        int
 	}{
-		{"own playlist", me, false, me, true},
-		{"own collaborative", me, true, me, true},
-		{"other user's playlist", "otheruser", false, me, false},
-		{"other user's collaborative", "otheruser", true, me, true},
-		{"no userID fallback", "otheruser", false, "", true},
+		{releaseDate: "1994-02-01", want: 1994},
+		{releaseDate: "1994-02", want: 1994},
+		{releaseDate: "1994", want: 1994},
+		{releaseDate: "", want: 0},
+		{releaseDate: "n/a", want: 0},
 	}
-
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			item := spotifyPlaylistItem{
-				ID:            "pl1",
-				Name:          "Test",
-				Collaborative: tt.collaborative,
-			}
-			item.Owner.ID = tt.ownerID
-
-			got := playlistAccessible(item, tt.userID)
-			if got != tt.want {
-				t.Errorf("playlistAccessible(owner=%q, collaborative=%v, userID=%q) = %v, want %v",
-					tt.ownerID, tt.collaborative, tt.userID, got, tt.want)
+		t.Run(tt.releaseDate, func(t *testing.T) {
+			got := albumFromItem(&spotifyAlbumItem{ID: "al", Name: "Album", ReleaseDate: tt.releaseDate})
+			if got.Year != tt.want {
+				t.Errorf("Year = %d, want %d", got.Year, tt.want)
 			}
 		})
 	}
+}
+
+// TestAuthenticateCancelsEarlierFlow runs three overlapping sign-ins. Each
+// new call must cancel the one before it, also after an older call returns
+// late, and Close must cancel the last one.
+func TestAuthenticateCancelsEarlierFlow(t *testing.T) {
+	type flow struct {
+		ctx     context.Context
+		release chan struct{}
+	}
+	started := make(chan flow)
+	orig := signIn
+	t.Cleanup(func() { signIn = orig })
+	signIn = func(ctx context.Context, _ string, _ *Session) (*Session, error) {
+		f := flow{ctx, make(chan struct{})}
+		started <- f
+		<-f.release
+		return nil, ctx.Err()
+	}
+
+	p := New(nil, "client", 320)
+	errs := make(chan error, 3)
+	var flows []flow
+	// finish lets flow i return and checks that it ended as canceled.
+	finish := func(i int) {
+		t.Helper()
+		close(flows[i].release)
+		if err := <-errs; !errors.Is(err, context.Canceled) {
+			t.Fatalf("sign-in %d error = %v, want context.Canceled", i+1, err)
+		}
+	}
+	for i := range 3 {
+		go func() { errs <- p.Authenticate() }()
+		flows = append(flows, <-started)
+		if i == 0 {
+			continue
+		}
+		if flows[i-1].ctx.Err() == nil {
+			t.Fatalf("sign-in %d did not cancel sign-in %d", i+1, i)
+		}
+		// The older call returns after the newer call took over.
+		finish(i - 1)
+	}
+	p.Close()
+	if flows[2].ctx.Err() == nil {
+		t.Fatal("Close did not cancel the last sign-in")
+	}
+	finish(2)
 }

@@ -8,28 +8,12 @@ import (
 
 	"charm.land/lipgloss/v2"
 
-	"cliamp/playlist"
-	"cliamp/ui"
+	"github.com/bjarneo/cliamp/playlist"
+	"github.com/bjarneo/cliamp/theme"
+	"github.com/bjarneo/cliamp/ui"
 )
 
-func withFrameWidth(t *testing.T, width int) {
-	t.Helper()
-	prevFrameStyle := ui.FrameStyle
-	prevPanelWidth := ui.PanelWidth
-	ui.FrameStyle = ui.FrameStyle.Width(width)
-	ui.PanelWidth = max(0, width-2*ui.PaddingH)
-	t.Cleanup(func() {
-		ui.FrameStyle = prevFrameStyle
-		ui.PanelWidth = prevPanelWidth
-	})
-}
-
 func TestMainViewShrinksPlaylistForFooterMessages(t *testing.T) {
-	if sharedPlayer == nil {
-		t.Skip("audio hardware unavailable")
-	}
-	withFrameWidth(t, 80)
-
 	pl := playlist.New()
 	for i := range 12 {
 		pl.Add(playlist.Track{
@@ -39,33 +23,69 @@ func TestMainViewShrinksPlaylistForFooterMessages(t *testing.T) {
 	}
 
 	m := Model{
-		player:    sharedPlayer,
+		player:    &playbackFakeEngine{},
 		playlist:  pl,
-		vis:       ui.NewVisualizer(float64(sharedPlayer.SampleRate())),
+		vis:       ui.NewVisualizer(44100),
 		width:     80,
 		plVisible: 3,
 	}
 	m.vis.Mode = ui.VisNone
 	m.save.startDownload()
 	m.status.Show("Saved", statusTTLDefault)
+	m.recomputeLayout()
 	m.height = m.mainFrameFixedLines(true) + 1
+	m.recomputeLayout()
 
-	if got := m.effectivePlaylistVisible(); got != 1 {
-		t.Fatalf("effectivePlaylistVisible() = %d, want 1 with one row left after footer lines", got)
+	if got := m.effectivePlaylistVisible(); got != m.layout.bodyRows {
+		t.Fatalf("effectivePlaylistVisible() = %d, want body budget %d", got, m.layout.bodyRows)
 	}
 	if got := lipgloss.Height(m.View().Content); got > m.height {
 		t.Fatalf("View() height = %d, want <= %d after footer lines shrink playlist", got, m.height)
 	}
 }
 
-func TestRenderPlaylistKeepsCursorVisibleWhenFooterShrinksBudget(t *testing.T) {
-	if sharedPlayer == nil {
-		t.Skip("audio hardware unavailable")
+func TestViewAppliesThemeBackground(t *testing.T) {
+	applyThemeAll(theme.Theme{
+		Name:     "test",
+		BG:       "#112233",
+		Accent:   "#88aacc",
+		BrightFG: "#ffffff",
+		FG:       "#aabbcc",
+		Green:    "#88cc88",
+		Yellow:   "#ddcc77",
+		Red:      "#ee8888",
+	})
+	t.Cleanup(func() { applyThemeAll(theme.Default()) })
+
+	m := Model{width: 20, height: 5}
+	m.recomputeLayout()
+	view := m.View()
+	if view.BackgroundColor == nil {
+		t.Fatal("BackgroundColor is nil for a theme with bg")
 	}
-	withFrameWidth(t, 80)
+	if view.ForegroundColor == nil {
+		t.Fatal("ForegroundColor is nil for a theme with bg")
+	}
+	r, g, b, _ := view.BackgroundColor.RGBA()
+	if r>>8 != 0x11 || g>>8 != 0x22 || b>>8 != 0x33 {
+		t.Fatalf("BackgroundColor = #%02x%02x%02x, want #112233", r>>8, g>>8, b>>8)
+	}
+}
 
-	sharedPlayer.Stop()
+func TestRenderTransientIncludesNonColorSeverityLabels(t *testing.T) {
+	m := Model{layout: frameLayout{panelWidth: 80}}
+	m.status.Warning("Unavailable", statusTTLShort)
+	if got := stripAnsi(m.renderTransient()); !strings.Contains(got, "WARN: Unavailable") {
+		t.Fatalf("warning feedback = %q, want WARN label", got)
+	}
 
+	m.status.Error("Load failed", statusTTLShort)
+	if got := stripAnsi(m.renderTransient()); !strings.Contains(got, "ERR: Load failed") {
+		t.Fatalf("error feedback = %q, want ERR label", got)
+	}
+}
+
+func TestRenderPlaylistKeepsCursorVisibleWhenFooterShrinksBudget(t *testing.T) {
 	pl := playlist.New()
 	for i := range 12 {
 		pl.Add(playlist.Track{
@@ -75,9 +95,9 @@ func TestRenderPlaylistKeepsCursorVisibleWhenFooterShrinksBudget(t *testing.T) {
 	}
 
 	m := Model{
-		player:    sharedPlayer,
+		player:    &playbackFakeEngine{},
 		playlist:  pl,
-		vis:       ui.NewVisualizer(float64(sharedPlayer.SampleRate())),
+		vis:       ui.NewVisualizer(44100),
 		width:     80,
 		focus:     focusPlaylist,
 		plVisible: 3,
@@ -87,10 +107,12 @@ func TestRenderPlaylistKeepsCursorVisibleWhenFooterShrinksBudget(t *testing.T) {
 	m.vis.Mode = ui.VisNone
 	m.save.startDownload()
 	m.status.Show("Saved", statusTTLDefault)
+	m.recomputeLayout()
 	m.height = m.mainFrameFixedLines(true) + 2
+	m.recomputeLayout()
 
-	if got := m.effectivePlaylistVisible(); got != 2 {
-		t.Fatalf("effectivePlaylistVisible() = %d, want 2 with footer-shrunk playlist", got)
+	if got := m.effectivePlaylistVisible(); got != m.layout.bodyRows {
+		t.Fatalf("effectivePlaylistVisible() = %d, want body budget %d", got, m.layout.bodyRows)
 	}
 
 	out := m.renderPlaylist()
@@ -100,18 +122,14 @@ func TestRenderPlaylistKeepsCursorVisibleWhenFooterShrinksBudget(t *testing.T) {
 }
 
 func TestViewConsumesInitialVisualizerRefresh(t *testing.T) {
-	if sharedPlayer == nil {
-		t.Skip("audio hardware unavailable")
-	}
-	withFrameWidth(t, 80)
-
 	m := Model{
-		player:   sharedPlayer,
+		player:   &playbackFakeEngine{},
 		playlist: playlist.New(),
-		vis:      ui.NewVisualizer(float64(sharedPlayer.SampleRate())),
+		vis:      ui.NewVisualizer(44100),
 		width:    80,
 		height:   24,
 	}
+	m.recomputeLayout()
 
 	if !m.vis.RefreshPending() {
 		t.Fatal("refreshPending = false on new visualizer, want initial refresh request")
@@ -128,18 +146,12 @@ func TestViewConsumesInitialVisualizerRefresh(t *testing.T) {
 }
 
 func TestOverlayViewIncludesFooterMessages(t *testing.T) {
-	if sharedPlayer == nil {
-		t.Skip("audio hardware unavailable")
-	}
-	withFrameWidth(t, 80)
-	sharedPlayer.Stop()
-
 	// Footer/transient messages are now rendered by the inline overlay layout
 	// (mainSectionsOverlay) rather than by each overlay renderer.
 	m := Model{
-		player:    sharedPlayer,
+		player:    &playbackFakeEngine{},
 		playlist:  playlist.New(),
-		vis:       ui.NewVisualizer(float64(sharedPlayer.SampleRate())),
+		vis:       ui.NewVisualizer(44100),
 		width:     80,
 		height:    24,
 		plVisible: 5,
@@ -156,16 +168,10 @@ func TestOverlayViewIncludesFooterMessages(t *testing.T) {
 }
 
 func TestKeymapRendersInline(t *testing.T) {
-	if sharedPlayer == nil {
-		t.Skip("audio hardware unavailable")
-	}
-	withFrameWidth(t, 80)
-	sharedPlayer.Stop()
-
 	m := Model{
-		player:    sharedPlayer,
+		player:    &playbackFakeEngine{},
 		playlist:  playlist.New(),
-		vis:       ui.NewVisualizer(float64(sharedPlayer.SampleRate())),
+		vis:       ui.NewVisualizer(44100),
 		width:     80,
 		height:    24,
 		plVisible: 5,
@@ -175,6 +181,7 @@ func TestKeymapRendersInline(t *testing.T) {
 		},
 	}
 	m.vis.Mode = ui.VisNone
+	m.recomputeLayout()
 
 	out := m.View().Content
 	if got := lipgloss.Height(out); got > m.height {
@@ -188,22 +195,16 @@ func TestKeymapRendersInline(t *testing.T) {
 }
 
 func TestFullVisualizerViewFitsTerminalWidth(t *testing.T) {
-	if sharedPlayer == nil {
-		t.Skip("audio hardware unavailable")
-	}
-	withFrameWidth(t, 80)
-
-	sharedPlayer.Stop()
-
 	m := Model{
-		player:   sharedPlayer,
+		player:   &playbackFakeEngine{},
 		playlist: playlist.New(),
-		vis:      ui.NewVisualizer(float64(sharedPlayer.SampleRate())),
+		vis:      ui.NewVisualizer(44100),
 		width:    80,
 		height:   24,
 		fullVis:  true,
 	}
 	m.vis.Mode = ui.VisNone
+	m.recomputeLayout()
 
 	if got := lipgloss.Width(m.View().Content); got > m.width {
 		t.Fatalf("View() width = %d, want <= %d in full visualizer mode", got, m.width)
@@ -217,13 +218,6 @@ func stripAnsi(str string) string {
 }
 
 func TestRenderPlaylistAddsPaddingToTrackNumber(t *testing.T) {
-	if sharedPlayer == nil {
-		t.Skip("audio hardware unavailable")
-	}
-	withFrameWidth(t, 80)
-
-	sharedPlayer.Stop()
-
 	pl := playlist.New()
 	for i := range 120 {
 		pl.Add(playlist.Track{
@@ -233,14 +227,16 @@ func TestRenderPlaylistAddsPaddingToTrackNumber(t *testing.T) {
 	}
 
 	m := Model{
-		player:    sharedPlayer,
-		playlist:  pl,
-		vis:       ui.NewVisualizer(float64(sharedPlayer.SampleRate())),
-		width:     80,
-		plVisible: 120,
+		player:         &playbackFakeEngine{},
+		playlist:       pl,
+		vis:            ui.NewVisualizer(44100),
+		width:          80,
+		heightExpanded: true,
 	}
 	m.vis.Mode = ui.VisNone
-	m.height = m.mainFrameFixedLines(false) + 120
+	m.recomputeLayout()
+	m.height = m.mainFrameFixedLines(true) + 120
+	m.recomputeLayout()
 
 	out := m.renderPlaylist()
 	lines := strings.Split(out, "\n")

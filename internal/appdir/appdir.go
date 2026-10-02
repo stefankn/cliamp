@@ -48,6 +48,11 @@ func PluginDir() (string, error) {
 // DataDir returns the cliamp data directory (~/.local/share/cliamp), used for
 // state that is not user-edited config: plugin stores, downloaded assets, etc.
 func DataDir() (string, error) {
+	// Honor HOME first, matching Dir(); on Windows os.UserHomeDir() reads
+	// USERPROFILE and ignores HOME, so this keeps the two resolvers consistent.
+	if home, ok := os.LookupEnv("HOME"); ok && home != "" {
+		return filepath.Join(home, ".local", "share", "cliamp"), nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err

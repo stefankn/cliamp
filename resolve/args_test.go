@@ -1,6 +1,9 @@
 package resolve
 
 import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -162,6 +165,16 @@ func TestArgsRemoteAudioURLBecomesTrack(t *testing.T) {
 	}
 }
 
+func TestURLResolvesRawStream(t *testing.T) {
+	tracks, err := URL("https://example.com/live.mp3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tracks) != 1 || tracks[0].Path != "https://example.com/live.mp3" {
+		t.Fatalf("tracks = %#v", tracks)
+	}
+}
+
 func TestArgsLocalM3U(t *testing.T) {
 	dir := t.TempDir()
 	// Write a local m3u that points at a dummy audio file.
@@ -253,5 +266,93 @@ func TestScanTracksPreservesOrder(t *testing.T) {
 		if tr.Path != paths[i] {
 			t.Errorf("tracks[%d].Path = %q, want %q", i, tr.Path, paths[i])
 		}
+	}
+}
+
+// TestRemoteM3UKeepsFileOrder checks that expansion is order-preserving, which
+// is what makes the startup playlist match the order cliamp renders. A sorted
+// or reordered expansion would silently diverge from the pane.
+func TestRemoteM3UKeepsFileOrder(t *testing.T) {
+	const body = `#EXTM3U
+#EXTINF:-1,Zulu
+http://example.invalid/zulu/stream
+#EXTINF:-1,Alpha
+http://example.invalid/alpha/stream
+#EXTINF:-1,Mike
+http://example.invalid/mike/stream
+`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "audio/x-mpegurl")
+		fmt.Fprint(w, body)
+	}))
+	defer srv.Close()
+
+	tracks, err := Remote([]string{srv.URL + "/streams.m3u"})
+	if err != nil {
+		t.Fatalf("Remote error = %v", err)
+	}
+
+	want := []string{"Zulu", "Alpha", "Mike"}
+	if len(tracks) != len(want) {
+		t.Fatalf("got %d tracks, want %d", len(tracks), len(want))
+	}
+	for i, title := range want {
+		if tracks[i].Title != title {
+			t.Fatalf("track %d = %q, want %q (file order must survive)", i+1, tracks[i].Title, title)
+		}
+		if !tracks[i].Stream || !tracks[i].Realtime {
+			t.Errorf("track %q: Stream=%v Realtime=%v, want both true for a live stream",
+				title, tracks[i].Stream, tracks[i].Realtime)
+		}
+	}
+}
+
+// TestArgsLiteralPathWithGlobMetacharacters checks that a path which exists
+// on disk resolves to itself, even when its brackets also match a sibling
+// as a glob character class.
+func TestArgsLiteralPathWithGlobMetacharacters(t *testing.T) {
+	dir := t.TempDir()
+	for _, p := range []string{
+		"Song [Live].mp3",
+		"Song L.mp3",
+		filepath.Join("Album [2001]", "a.mp3"),
+		filepath.Join("Album 2", "b.mp3"),
+	} {
+		full := filepath.Join(dir, p)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(full, []byte(""), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+	}
+
+	tests := []struct {
+		name string
+		arg  string
+		want []string
+	}{
+		{"bracketed file", "Song [Live].mp3", []string{"Song [Live].mp3"}},
+		{"bracketed folder", "Album [2001]", []string{filepath.Join("Album [2001]", "a.mp3")}},
+		{"pattern still globs", "Song*.mp3", []string{"Song L.mp3", "Song [Live].mp3"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := Args([]string{filepath.Join(dir, tt.arg)})
+			if err != nil {
+				t.Fatalf("Args: %v", err)
+			}
+			var paths []string
+			for _, tr := range got.Tracks {
+				rel, err := filepath.Rel(dir, tr.Path)
+				if err != nil {
+					t.Fatalf("Rel: %v", err)
+				}
+				paths = append(paths, rel)
+			}
+			if !slices.Equal(paths, tt.want) {
+				t.Errorf("tracks = %q, want %q", paths, tt.want)
+			}
+		})
 	}
 }

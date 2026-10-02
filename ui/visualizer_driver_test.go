@@ -97,6 +97,86 @@ func TestSmoothBarsDriverUsesAnimTick(t *testing.T) {
 	}
 }
 
+func TestFastFrameDriverTracksWallClockAtNormalUICadence(t *testing.T) {
+	v := NewVisualizer(44100)
+	v.Mode = VisScope
+	v.Cols = 80
+	t0 := time.Unix(1, 0)
+	v.Tick(VisTickContext{Now: t0, Playing: true})
+
+	const ticks = 20
+	for i := 1; i <= ticks; i++ {
+		v.Tick(VisTickContext{Now: t0.Add(time.Duration(i) * TickFast), Playing: true})
+	}
+
+	want := uint64(1 + time.Duration(ticks)*TickFast/TickAnim)
+	if got := v.Frame(); got != want {
+		t.Fatalf("Scope frame after %v = %d, want %d", time.Duration(ticks)*TickFast, got, want)
+	}
+}
+
+func TestNormalFrameDriverAdvancesOncePerTick(t *testing.T) {
+	v := NewVisualizer(44100)
+	v.Mode = VisPulse
+	v.Cols = 80
+	t0 := time.Unix(1, 0)
+
+	for i := range 5 {
+		v.Tick(VisTickContext{Now: t0.Add(time.Duration(i) * TickFast), Playing: true})
+		if got, want := v.Frame(), uint64(i+1); got != want {
+			t.Fatalf("Pulse frame after tick %d = %d, want %d", i+1, got, want)
+		}
+	}
+}
+
+func TestFastFrameDriverBoundsCatchUp(t *testing.T) {
+	v := NewVisualizer(44100)
+	v.Mode = VisScope
+	v.Cols = 80
+	t0 := time.Unix(1, 0)
+	v.Tick(VisTickContext{Now: t0, Playing: true})
+	v.Tick(VisTickContext{Now: t0.Add(time.Second), Playing: true})
+
+	want := uint64(1 + maxAnimationCatchUpSteps)
+	if got := v.Frame(); got != want {
+		t.Fatalf("Scope frame after stalled tick = %d, want bounded catch-up to %d", got, want)
+	}
+}
+
+func TestFastFrameDriverDoesNotCatchUpPausedOrHiddenTime(t *testing.T) {
+	tests := []struct {
+		name    string
+		suspend func(*Visualizer, time.Time)
+	}{
+		{
+			name: "paused",
+			suspend: func(v *Visualizer, now time.Time) {
+				v.Tick(VisTickContext{Now: now, Playing: true, Paused: true})
+			},
+		},
+		{name: "hidden", suspend: func(v *Visualizer, _ time.Time) { v.Suspend() }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := NewVisualizer(44100)
+			v.Mode = VisScope
+			v.Cols = 80
+			t0 := time.Unix(1, 0)
+			v.Tick(VisTickContext{Now: t0, Playing: true})
+			v.Tick(VisTickContext{Now: t0.Add(TickFast), Playing: true})
+			before := v.Frame()
+
+			tt.suspend(v, t0.Add(2*TickFast))
+			v.Tick(VisTickContext{Now: t0.Add(2 * time.Second), Playing: true})
+
+			if got := v.Frame(); got != before+1 {
+				t.Fatalf("Scope frame after resume = %d, want %d", got, before+1)
+			}
+		})
+	}
+}
+
 func TestAdvanceSmoothingEasesTowardBands(t *testing.T) {
 	v := NewVisualizer(44100)
 	v.bands = []float64{1.0, 0.0}
@@ -138,8 +218,140 @@ func TestAdvanceSmoothingResizesOnBandCountChange(t *testing.T) {
 	}
 }
 
+func TestPausedBarsDecayToRestThenSuspend(t *testing.T) {
+	v := NewVisualizer(44100)
+	v.Cols = 16
+	activateMode(t, v, VisBars)
+	v.bands = uniformBands(0.8)
+	v.smoothedBands = append([]float64(nil), v.bands...)
+
+	analyze := func(spec VisAnalysisSpec) []float64 {
+		return v.Analyze(nil, spec)
+	}
+	ctxAt := func(now time.Time) VisTickContext {
+		return VisTickContext{Now: now, Paused: true, Analyze: analyze}
+	}
+
+	prev := append([]float64(nil), v.SmoothedBands()...)
+	settled := false
+	now := time.Unix(1, 0)
+	for i := 0; i < 240; i++ {
+		v.Tick(ctxAt(now.Add(time.Duration(i+1) * TickSlow)))
+		cur := v.SmoothedBands()
+		for b := range len(cur) {
+			if cur[b] > prev[b]+1e-9 {
+				t.Fatalf("paused tick %d band %d rose %v -> %v, want monotonic decay", i, b, prev[b], cur[b])
+			}
+		}
+		prev = append(prev[:0], cur...)
+		if !v.PausedDecayPending(ctxAt(now.Add(time.Duration(i+2) * TickSlow))) {
+			settled = true
+			break
+		}
+	}
+	if !settled {
+		t.Fatal("paused bars never settled to rest")
+	}
+	for i, got := range prev {
+		if got >= pausedDecayEpsilon {
+			t.Fatalf("band %d = %v after decay, want below %v", i, got, pausedDecayEpsilon)
+		}
+	}
+
+	// Once settled, further paused ticks suspend and leave the frame alone.
+	frameBefore := v.Frame()
+	v.Tick(ctxAt(now.Add(10 * time.Second)))
+	if got := v.Frame(); got != frameBefore {
+		t.Fatalf("settled paused tick advanced frame %d -> %d", frameBefore, got)
+	}
+	for i, got := range v.SmoothedBands() {
+		if math.Abs(got-prev[i]) > 1e-9 {
+			t.Fatalf("settled paused tick changed band %d %v -> %v", i, prev[i], got)
+		}
+	}
+}
+
+func TestPausedRawSampleModeClearsWaveform(t *testing.T) {
+	v := NewVisualizer(44100)
+	v.Cols = 74
+	activateMode(t, v, VisWave)
+	v.waveBuf = []float64{-0.5, 0.5}
+	ctx := VisTickContext{Paused: true}
+
+	if !v.PausedDecayPending(ctx) {
+		t.Fatal("raw waveform was considered settled before being cleared")
+	}
+	v.Tick(ctx)
+	if len(v.waveBuf) != 0 {
+		t.Fatalf("waveBuf len = %d after pause, want 0", len(v.waveBuf))
+	}
+	if v.PausedDecayPending(ctx) {
+		t.Fatal("raw waveform still settling after pause clear")
+	}
+}
+
+func TestModeSwitchClearsSmoothedBands(t *testing.T) {
+	v := NewVisualizer(44100)
+	activateMode(t, v, VisBars)
+	v.smoothedBands = uniformBands(0.8)
+
+	activateMode(t, v, VisClassicPeak)
+	if len(v.smoothedBands) != 0 {
+		t.Fatalf("smoothedBands len = %d after mode switch, want 0", len(v.smoothedBands))
+	}
+}
+
+func TestPausedGeyserWaitsForParticles(t *testing.T) {
+	v := NewVisualizer(44100)
+	v.Cols = 16
+	v.Rows = 5
+	activateMode(t, v, VisGeyser)
+	driver := v.driverFor(VisGeyser).(*geyserDriver)
+	driver.particles = []geyserParticle{{x: 1, y: float64(v.Rows * 4), tier: 1}}
+	v.bands = uniformBands(0)
+	v.smoothedBands = uniformBands(0)
+	ctx := VisTickContext{Paused: true}
+
+	if !v.PausedDecayPending(ctx) {
+		t.Fatal("geyser was considered settled with a live particle")
+	}
+	v.Tick(ctx)
+	if len(driver.particles) != 0 {
+		t.Fatalf("geyser particles = %d after off-screen decay, want 0", len(driver.particles))
+	}
+	if v.PausedDecayPending(ctx) {
+		t.Fatal("geyser still settling after particles expired")
+	}
+}
+
+func TestPausedSandWaitsForExplosion(t *testing.T) {
+	v := NewVisualizer(44100)
+	v.Cols = 16
+	v.Rows = 5
+	activateMode(t, v, VisSand)
+	driver := v.driverFor(VisSand).(*sandDriver)
+	driver.grid.resize(v.Rows*4, v.Cols*2)
+	driver.particles = []sandParticle{{x: 1, y: float64(v.Rows * 4), tier: 1}}
+	driver.explosionTTL = 1
+	v.bands = uniformBands(0)
+	v.smoothedBands = uniformBands(0)
+	ctx := VisTickContext{Paused: true}
+
+	if !v.PausedDecayPending(ctx) {
+		t.Fatal("sand was considered settled during an explosion")
+	}
+	v.Tick(ctx)
+	if len(driver.particles) != 0 || driver.explosionTTL != 0 {
+		t.Fatalf("sand explosion state after decay = particles %d, ttl %d", len(driver.particles), driver.explosionTTL)
+	}
+	if v.PausedDecayPending(ctx) {
+		t.Fatal("sand still settling after explosion expired")
+	}
+}
+
 func TestDefaultDriverTickGatesAnalyzeAtAnalyzeCadence(t *testing.T) {
 	v := NewVisualizer(44100)
+	v.Cols = 74
 	activateMode(t, v, VisBars)
 
 	calls := 0
@@ -183,6 +395,7 @@ func TestRenderOnlyDriverSkipsAnalyzeUnderOverlay(t *testing.T) {
 
 func TestRenderOnlyDriverRequestsConfiguredBandCount(t *testing.T) {
 	v := NewVisualizer(44100)
+	v.Cols = 74
 	activateMode(t, v, VisBars)
 
 	var requested VisAnalysisSpec
@@ -204,6 +417,7 @@ func TestRenderOnlyDriverRequestsConfiguredBandCount(t *testing.T) {
 
 func TestClassicPeakRequestsHighResBands(t *testing.T) {
 	v := NewVisualizer(44100)
+	v.Cols = 74
 	activateMode(t, v, VisClassicPeak)
 
 	var requested VisAnalysisSpec
@@ -216,7 +430,7 @@ func TestClassicPeakRequestsHighResBands(t *testing.T) {
 		},
 	})
 
-	want := VisAnalysisSpec{BandCount: classicPeakSpectrumBands, FFTSize: classicPeakFFTSize}
+	want := VisAnalysisSpec{BandCount: classicPeakSpectrumBands, FFTSize: classicPeakFFTSize, Tap: VisTapAudible}
 	if requested != want {
 		t.Fatalf("Analyze() requested %+v, want %+v", requested, want)
 	}
@@ -227,6 +441,7 @@ func TestClassicPeakRequestsHighResBands(t *testing.T) {
 
 func TestRawSampleModesRefreshWaveBufAtZeroBandCount(t *testing.T) {
 	v := NewVisualizer(44100)
+	v.Cols = 74
 	activateMode(t, v, VisWave)
 
 	samples := []float64{-0.5, -0.1, 0.25, 0.75}
@@ -239,12 +454,39 @@ func TestRawSampleModesRefreshWaveBufAtZeroBandCount(t *testing.T) {
 		},
 	})
 
-	want := spectrumAnalysisSpec(0)
+	want := VisAnalysisSpec{FFTSize: defaultFFTSize, Tap: VisTapAudible}
 	if requested != want {
 		t.Fatalf("Analyze() requested %+v, want %+v for raw-sample modes", requested, want)
 	}
 	if !reflect.DeepEqual(v.waveBuf, samples) {
 		t.Fatalf("waveBuf = %v, want %v after zero-band tick refresh", v.waveBuf, samples)
+	}
+}
+
+func TestRawSampleModesAnalyzeEveryTick(t *testing.T) {
+	for _, mode := range []VisMode{VisWave, VisScope, VisHeartbeat} {
+		t.Run(visModes[mode].name, func(t *testing.T) {
+			v := NewVisualizer(44100)
+			v.Cols = 80
+			activateMode(t, v, mode)
+
+			calls := 0
+			ctx := VisTickContext{
+				Now:     time.Unix(1, 0),
+				Playing: true,
+				Analyze: func(spec VisAnalysisSpec) []float64 {
+					calls++
+					return v.Analyze([]float64{float64(calls)}, spec)
+				},
+			}
+			v.Tick(ctx)
+			ctx.Now = ctx.Now.Add(TickWave)
+			v.Tick(ctx)
+
+			if calls != 2 {
+				t.Fatalf("Analyze calls = %d, want 2", calls)
+			}
+		})
 	}
 }
 
@@ -268,9 +510,8 @@ func TestRawSampleModesClearSpectrumHistoryOnModeSwitch(t *testing.T) {
 }
 
 func TestTerrainPreservesStateAcrossModeSwitch(t *testing.T) {
-	withPanelWidth(t, 8)
-
 	v := NewVisualizer(44100)
+	v.Cols = 8
 	activateMode(t, v, VisTerrain)
 	driver := terrainDriverFor(t, v)
 	bands := uniformBands(0.6)
@@ -278,8 +519,8 @@ func TestTerrainPreservesStateAcrossModeSwitch(t *testing.T) {
 
 	v.Tick(VisTickContext{})
 	snapshot := append([]float64(nil), driver.buf...)
-	if len(snapshot) != PanelWidth*2 {
-		t.Fatalf("terrain buffer len = %d, want %d", len(snapshot), PanelWidth*2)
+	if len(snapshot) != v.Cols*2 {
+		t.Fatalf("terrain buffer len = %d, want %d", len(snapshot), v.Cols*2)
 	}
 
 	activateMode(t, v, VisBars)
@@ -296,9 +537,8 @@ func TestTerrainPreservesStateAcrossModeSwitch(t *testing.T) {
 }
 
 func TestTerrainRenderDoesNotAdvanceWithoutTick(t *testing.T) {
-	withPanelWidth(t, 8)
-
 	v := NewVisualizer(44100)
+	v.Cols = 8
 	activateMode(t, v, VisTerrain)
 	driver := terrainDriverFor(t, v)
 	v.bands = uniformBands(0.6)
@@ -315,9 +555,8 @@ func TestTerrainRenderDoesNotAdvanceWithoutTick(t *testing.T) {
 }
 
 func TestTerrainTickSkipsAnalyzeUnderOverlay(t *testing.T) {
-	withPanelWidth(t, 8)
-
 	v := NewVisualizer(44100)
+	v.Cols = 8
 	activateMode(t, v, VisTerrain)
 	driver := terrainDriverFor(t, v)
 	driver.buf = append([]float64(nil), []float64{
@@ -342,5 +581,95 @@ func TestTerrainTickSkipsAnalyzeUnderOverlay(t *testing.T) {
 	}
 	if !reflect.DeepEqual(driver.buf, snapshot) {
 		t.Fatalf("terrain buffer changed under overlay: got %v want %v", driver.buf, snapshot)
+	}
+}
+
+// The stateful spectrum drivers and the Lua driver take their analysis spec
+// and cadence from spectrumDriverBase.
+func TestSpectrumDriverBaseDefaults(t *testing.T) {
+	v := NewVisualizer(44100)
+	v.RegisterLuaVisualizers([]string{"plugin"}, nil)
+	contexts := []VisTickContext{
+		{Playing: true},
+		{},
+		{Playing: true, OverlayActive: true},
+	}
+	for _, mode := range []VisMode{VisFlame, VisTerrain, VisMosaic, VisSand, VisGeyser, VisRedSector, VisCount} {
+		driver := v.driverFor(mode)
+		v.Mode = mode
+		t.Run(v.ModeName(), func(t *testing.T) {
+			if got, want := driver.AnalysisSpec(v), spectrumAnalysisSpec(DefaultSpectrumBands); got != want {
+				t.Errorf("AnalysisSpec = %+v, want %+v", got, want)
+			}
+			for _, ctx := range contexts {
+				if got, want := driver.TickInterval(v, ctx), defaultDriverTickInterval(ctx); got != want {
+					t.Errorf("TickInterval(%+v) = %v, want %v", ctx, got, want)
+				}
+			}
+		})
+	}
+}
+
+// Each mode declares which audio tap feeds its analysis and whether the model
+// ticks it at its own cadence. The model reads both from the visualizer and
+// no longer checks for a mode by name.
+func TestModesDeclareTapAndCadence(t *testing.T) {
+	audible := map[VisMode]bool{
+		VisClassicPeak: true,
+		VisWave:        true,
+		VisScope:       true,
+		VisHeartbeat:   true,
+	}
+	for mode := range VisCount {
+		t.Run(visModes[mode].name, func(t *testing.T) {
+			v := NewVisualizer(44100)
+			v.Mode = mode
+			v.Cols = 40
+			v.Rows = 5
+			var taps []VisTap
+			v.Tick(VisTickContext{
+				Now:     time.Unix(1, 0),
+				Playing: true,
+				Analyze: func(spec VisAnalysisSpec) []float64 {
+					taps = append(taps, NormalizeAnalysisSpec(spec).Tap)
+					return nil
+				},
+			})
+			if analyzes := mode != VisStereo && mode != VisNone; analyzes && len(taps) == 0 {
+				t.Fatal("Tick did not call Analyze")
+			}
+			want := VisTapLatest
+			if audible[mode] {
+				want = VisTapAudible
+			}
+			for _, tap := range taps {
+				if tap != want {
+					t.Errorf("Analyze tap = %v, want %v", tap, want)
+				}
+			}
+			if got, want := v.DriverOwnsCadence(), mode == VisClassicPeak || mode == VisClassicLED; got != want {
+				t.Errorf("DriverOwnsCadence() = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestNormalizeAnalysisSpecTap(t *testing.T) {
+	tests := []struct {
+		name string
+		spec VisAnalysisSpec
+		want VisTap
+	}{
+		{name: "raw samples read the audible tap", spec: VisAnalysisSpec{}, want: VisTapAudible},
+		{name: "negative band count reads the audible tap", spec: VisAnalysisSpec{BandCount: -1}, want: VisTapAudible},
+		{name: "spectrum keeps the latest tap", spec: VisAnalysisSpec{BandCount: 10}, want: VisTapLatest},
+		{name: "spectrum keeps a declared audible tap", spec: VisAnalysisSpec{BandCount: 64, Tap: VisTapAudible}, want: VisTapAudible},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := NormalizeAnalysisSpec(tt.spec).Tap; got != tt.want {
+				t.Fatalf("Tap = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }

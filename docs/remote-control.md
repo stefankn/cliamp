@@ -1,154 +1,264 @@
 # Remote Control (IPC)
 
-Control a running cliamp instance from another terminal, a shell script, or an AI coding assistant.
+Control cliamp locally from a terminal, script, status bar, or GUI.
 
-When cliamp starts, it listens on a local IPC socket at `~/.config/cliamp/cliamp.sock` (or `%APPDATA%\cliamp\cliamp.sock` on Windows when `HOME` is unset). CLI subcommands connect to this socket to send playback commands and receive status. On Windows 10/11, this uses the same local socket transport via Go's AF_UNIX support.
+cliamp listens on `~/.config/cliamp/cliamp.sock` with `0600` permissions. It
+uses newline-delimited JSON over a local Unix socket. To use SSH, run the client
+command on the host that owns the socket.
 
-## Playback Commands
+The socket path can have at most 107 bytes on Linux and Windows and 103 bytes
+on macOS. When the path is longer, cliamp and its client commands stop with
+`socket path is too long`. Set `CLIAMP_CONFIG_DIR` to a shorter directory.
 
-```sh
-cliamp play                  # resume playback
-cliamp pause                 # pause playback
-cliamp toggle                # play/pause toggle
-cliamp next                  # next track
-cliamp prev                  # previous track
-cliamp stop                  # stop playback
-```
-
-## Status
+## Quick Start
 
 ```sh
-cliamp status                # human-readable current state
-cliamp status --json         # machine-readable JSON
+cliamp status --json
+cliamp next
+cliamp remote state
+cliamp remote events runtime.state runtime.job
 ```
 
-JSON output:
+`cliamp status --json` always includes `position`, `volume` and `index`,
+because 0 is a valid value of each. It leaves out other fields that have no
+value. `index` is `-1` when the playlist is empty.
+
+IPC supports version 2 only. Clients must send a V2 envelope with each request.
+See [Upgrading IPC Clients To V2](upgrading-ipc-v2.md) when you migrate a raw
+socket integration.
+
+## Version 2
+
+V2 responses use the request `id` and always include `"version":2`.
+
+```json
+{"version":2,"id":"state","method":"state.get"}
+{"version":2,"id":"play","method":"operation.submit","operation":"play","params":{}}
+{"version":2,"id":"queue","method":"operation.submit","operation":"queue.enqueue","params":{"index":4,"if_revision":18}}
+```
+
+Use these methods:
+
+| Method | Purpose |
+| --- | --- |
+| `capabilities` | List available operation names and parameter hints |
+| `state.get` | Read the runtime snapshot |
+| `spectrum.get` | Read current visualizer bands |
+| `operation.submit` | Start a runtime or library operation |
+| `job.get` | Read an operation job by `job_id` |
+| `job.cancel` | Request cancellation of an active job |
+| `subscribe` | Start a server-to-client event stream |
+
+`operation.submit` returns a job immediately. A job can become `queued`,
+`running`, `succeeded`, `failed`, or `canceled`. Its final record contains the
+operation result and the snapshot from the committed operation.
 
 ```json
 {
+  "version": 2,
+  "id": "play",
   "ok": true,
-  "state": "playing",
-  "track": {
-    "title": "Imperial March",
-    "artist": "John Williams",
-    "path": "/path/to/file.mp3"
-  },
-  "position": 42.5,
-  "duration": 183.0,
-  "volume": -3,
-  "playlist": "Star Wars OT",
-  "index": 12,
-  "total": 59,
-  "visualizer": "ClassicPeak",
-  "theme": {
-    "name": "Kanagawa Dragon",
-    "accent": "#658594",
-    "fg": "#c5c9c5",
-    "green": "#8a9a7b",
-    "yellow": "#c4b28a",
-    "red": "#c4746e"
+  "job": {
+    "id": "8f0d...",
+    "operation": "play",
+    "state": "queued"
   }
 }
 ```
 
-The `theme` block carries the active cliamp theme's resolved hex colors. Empty hex fields mean the default ANSI fallback theme is active.
+Fast operations can finish before the client requests `job.get`. Slow work,
+such as provider access, URL resolution, downloads, lyrics, and saved playlist
+writes, remains asynchronous.
 
-## Volume and Seek
+## Runtime Snapshot
 
-```sh
-cliamp volume -5             # adjust volume in dB
-cliamp seek 30               # seek to position in seconds
-```
-
-## Playlist Loading
-
-```sh
-cliamp load "Playlist Name"  # load a playlist into the player
-cliamp queue /path/to.mp3    # queue a single track
-```
-
-## Spectrum Streaming
-
-```sh
-cliamp visstream             # NDJSON spectrum frames at 30 fps (default)
-cliamp visstream --fps 60    # up to 60 fps; clamped to [1, 60]
-```
-
-`visstream` holds a single IPC connection open and emits one JSON line per frame containing the 10-band spectrum and the active visualizer mode name:
+`state.get` returns a snapshot with the active audio track, logical playlist
+track, playback state, position, duration, seekability, modes, EQ, visualizer,
+theme, stream error, and two revisions. `playlist` names the loaded saved
+playlist. After `provider.load` or `provider.load_album` of another list,
+`playlist` holds the provider key and the ID, for example `navidrome:42` or
+`navidrome:album:7`. `device` names the output device that the last `device`
+operation reported.
 
 ```json
-{"ok":true,"visualizer":"Bars","bands":[0.93,0.81,0.62,0.48,0.31,0.22,0.14,0.09,0.04,0.01]}
+{
+  "version": 2,
+  "id": "state",
+  "ok": true,
+  "snapshot": {
+    "revision": 18,
+    "playlist_revision": 7,
+    "state": "playing",
+    "track": {"title":"Song","path":"/music/song.flac"},
+    "logical_track": {"title":"Song","path":"/music/song.flac"},
+    "position": 42.5,
+    "duration": 183,
+    "seekable": true,
+    "play_next_total": 2
+  }
+}
 ```
 
-Band values are normalized to [0, 1], in the same shape cliamp uses internally for spectrum visualizers. This is what powers the [Quickshell now-playing widget](quickshell.md). Consumers can pipe stdout directly into another process (`cliamp visstream | jq`) or use it from a long-lived subprocess in a UI toolkit.
+`revision` changes when meaningful runtime state changes. `playlist_revision`
+changes when the live playlist or play-next list changes. Position-only playback
+ticks do not create events. Send `if_revision` with destructive live-playlist or
+play-next operations to reject stale GUI actions with the `conflict` error code.
 
-Under the hood it issues a `{"cmd":"bands"}` request per tick over the existing IPC socket; you can also issue this command directly from your own client if you want frame-pulled access:
+`track` keeps `provider_meta`, embedded playback flags, and directory-source
+state. A GUI can send a provider result through `track.play`,
+`track.queue`, `playlist.add`, `playlist.add_many`, or `playlist.replace`
+without losing provider identity. When cliamp saves such a track to a local
+playlist, Favorites or Recently Played, it keeps only the `provider_meta` keys
+that hold letters, digits, `.`, `_` and `-`.
 
-```json
-{"cmd": "bands"}
-```
+The `bookmark` field of `track` keeps its name for existing scripts. It reports
+the favorite ♥ state of the track, the same state as the playlist row marker.
+`cliamp status --json` shows it for the current track. cliamp ignores the field
+when a client sends a track, so use `playlist.bookmark` to change a favorite.
 
-Response:
+## Operations
 
-```json
-{"ok": true, "visualizer": "Bars", "bands": [0.93, 0.81, ...]}
-```
+Run `cliamp remote capabilities` to get the current machine-readable list.
 
-## Protocol
+| Group | Operations |
+| --- | --- |
+| Playback | `play`, `pause`, `toggle`, `stop`, `next`, `prev`, `volume`, `volume.adjust`, `seek`, `seek.absolute`, `speed`, `speed.adjust`, `shuffle`, `repeat`, `mono`, `eq`, `device` |
+| Appearance | `theme`, `vis` |
+| Live playlist | `queue`, `queue.list`, `queue.play`, `queue.enqueue`, `queue.remove`, `queue.move`, `queue.clear`, `track.play`, `track.queue` |
+| Play-next | `playnext.list`, `playnext.remove`, `playnext.move`, `playnext.clear` |
+| Sources | `load`, `url.load`, `save`, `lyrics`, `history`, `history.clear` |
+| Providers | `provider.list`, `provider.playlists`, `provider.tracks`, `provider.load`, `provider.search`, `provider.artists`, `provider.artist_albums`, `provider.albums`, `provider.album_tracks`, `provider.load_album`, `provider.favorite`, `provider.catalog` |
+| Saved playlists | `playlist.create`, `playlist.rename`, `playlist.delete`, `playlist.add`, `playlist.add_many`, `playlist.replace`, `playlist.remove`, `playlist.bookmark` |
+| Plugins | `plugin.call`, `plugin.commands` |
 
-The IPC protocol is newline-delimited JSON over a local stream socket. Each request is a single JSON object followed by a newline. The server responds with a single JSON object followed by a newline.
+`queue.*` applies to the live playlist. `playnext.*` applies only to the
+play-next list. They use separate zero-based indexes.
 
-Request format:
+`queue`, `queue.move`, and `queue.remove` follow the rules of the
+`Shift+Up`, `Shift+Down`, and `x` keys. The Lua `cliamp.queue` functions
+follow the same rules:
 
-```json
-{"cmd": "status"}
-{"cmd": "next"}
-{"cmd": "volume", "value": -5}
-{"cmd": "load", "playlist": "Star Wars OT"}
-{"cmd": "queue", "path": "/path/to/file.mp3"}
-```
+- `queue.move` swaps the tracks at `index` and `to`. While shuffle is on,
+  it fails with `conflict` and changes nothing.
+- When the live playlist mirrors a saved local playlist, `queue.move` saves
+  the new order to that playlist. `queue.remove` removes the track from it
+  too. When that save fails, the edit fails with `internal_error` and
+  changes nothing. Favorites is not a playlist file, so an edit of a loaded
+  Favorites list changes only the live playlist.
+- `queue`, `queue.move`, and `queue.remove` record no undo. After one of
+  them, `Ctrl+Z` does not undo the last TUI edit, because that undo would
+  drop the new change.
+- While the live playlist mirrors a saved local playlist, `queue.remove`
+  fails with `conflict` for a track that a directory source of that playlist
+  supplies. A removal of the playing track stops playback.
+- `queue` appends a track. The live playlist then mirrors no saved playlist.
+- When an edit changes the next track, cliamp re-arms the gapless preload.
 
-Response format:
+`vis` with the name `list` returns every mode in the order of the `v` key
+cycle: the built-in modes, then the visualizers of Lua plugins. `cliamp vis
+list` prints the same list when cliamp runs.
 
-```json
-{"ok": true}
-{"ok": true, "state": "playing", "track": {...}, ...}
-{"ok": false, "error": "cliamp is not running"}
-```
-
-## Socket Details
-
-- **Path**: `~/.config/cliamp/cliamp.sock` (or `%APPDATA%\cliamp\cliamp.sock` on Windows when `HOME` is unset; created on TUI start, removed on shutdown)
-- **Permissions**: `0600` (owner only)
-- **Stale detection**: A PID file (`cliamp.sock.pid`) tracks the owning process. If cliamp crashes, the next instance detects the stale socket and cleans it up.
-
-## Scripting Examples
+The `list` result also names the active mode in `visualizer` and gives its
+zero-based position in `items` as `index`. The result leaves out `index` when
+it is 0. A Lua visualizer can have the name of a built-in mode, so use `index`
+to find the active mode. `cliamp vis list` marks only that row.
 
 ```sh
-# Skip to next track and show what's playing
-cliamp next && cliamp status --json | jq .track.title
-
-# Pause from a tmux/cmux script
-cliamp pause
-
-# Load a playlist and start playing
-cliamp load "Blade Runner" && cliamp play
+cliamp remote call vis --params '{"name":"list"}' --wait
 ```
 
-## Headless Daemon Mode
+`theme list` and `cliamp theme list` return `Default - Terminal colors` as
+the first item. `theme` accepts that name or `default` to select the terminal
+colors.
 
-Run cliamp without a TUI and drive it entirely over this IPC interface — useful for status bars, hotkey scripts, cron jobs, and embedded boxes. See [Headless Daemon Mode](headless.md) for setup, use cases, and example configs (Waybar, Hyprland, systemd, cron).
+`eq` takes a built-in preset name, such as `Rock`, or a `band` and a `value`.
+It also accepts `Custom` to restore the saved custom curve. An unknown
+preset name fails the job and does not change the EQ.
+
+`shuffle` and `mono` take the `name` `on`, `off` or `toggle`. `repeat` takes
+`off`, `all`, `one` or `cycle`. With no `name`, they toggle or cycle. Any
+other name fails the job with `invalid_params` and changes nothing.
+
+`playlist.bookmark` keeps its name for existing scripts. It toggles the favorite
+♥ of `track`, as `f` does in the TUI. It needs a known `provider` key, but it
+does not change the playlist. A radio station toggles its station favorite,
+and its `bookmark` field in provider lists changes too. A station
+that is a row of a loaded saved playlist toggles the favorites store instead.
+The `bookmark` field of that row in `queue.list` changes. cliamp matches the
+row by path.
+
+Use IDs returned by `provider.playlists` for subsequent provider operations.
+Radio favorite IDs are stable `f:<station URL>` values, not positional
+`f:<index>` values.
+
+Request provider list responses with `offset` and `limit` when the provider
+supports paging. Use `playlist.replace` to save a GUI-created order, sort, or
+deduplication result as one operation when the provider supports playlist saving.
+
+## Events
+
+Subscribe with an exact topic list. The acknowledgement is V2. Later lines use
+the shared event envelope, so plugin and runtime events use the same form.
+
+```json
+{"version":2,"id":"events","method":"subscribe","topics":["runtime.state","runtime.job"]}
+```
+
+Core retained topics are `runtime.state`, `runtime.playback`,
+`runtime.playlist`, and `runtime.settings`. `runtime.job` is temporary and
+contains final job records. Plugin topics keep their `plugin.*` names.
+
+If a client cannot keep up, it receives `system.overflow` with
+`{"resync_required":true}` before the stream closes. Reconnect and request
+`state.get` before you accept more changes.
+
+## Spectrum Stream
+
+`cliamp visstream` uses V2 `spectrum.get` internally. It outputs one plain
+NDJSON frame at 30 FPS by default for status-bar and visualizer integrations.
+Use `--fps` to set a rate from 1 through 60. GUI clients can request one current
+frame with `spectrum.get`.
+
+## CLI V2 Client
 
 ```sh
-cliamp --daemon                              # no TUI, IPC only
-cliamp --daemon --auto-play --playlist Lofi  # start playing on launch
+cliamp remote state
+cliamp remote capabilities
+cliamp remote call queue.enqueue --params '{"index":4,"if_revision":18}' --wait
+cliamp remote job JOB_ID
+cliamp remote cancel JOB_ID
+cliamp remote events runtime.state runtime.job
 ```
 
-## Error Handling
+`remote call` prints the V2 response as JSON and can submit every listed
+operation. Use it in scripts and to validate a GUI integration.
 
-If cliamp is not running:
+Named CLI commands such as `cliamp volume`, `cliamp seek`, `cliamp load`, and
+`cliamp plugins call` use V2 jobs internally. `volume` sets an absolute dB
+value. `seek` is relative to the current position. V2 subscriptions read
+`plugin.*` topics and runtime events.
 
+## Headless Mode
+
+```sh
+cliamp --daemon --auto-play --playlist Lofi
 ```
-$ cliamp status
-cliamp is not running (no socket at /Users/you/.config/cliamp/cliamp.sock)
-```
+
+Headless mode runs the same player as the TUI with no screen. It exposes the
+same playback, queue, provider, saved-playlist, plugin, job, snapshot, and event
+APIs. It loads Lua plugins, reports plays to the providers, and records Recently
+Played when a track starts. It has no theme or visualizer selection, so `theme`
+and `vis` are not in `capabilities`. Use `capabilities` instead of assuming that
+each interactive-only operation is available.
+
+## Errors And Limits
+
+V2 errors use stable codes: `invalid_version`, `invalid_request`,
+`invalid_params`, `unknown_operation`, `not_found`, `conflict`, `unavailable`,
+`canceled`, and `internal_error`. Runtime failures can include a `detail` string
+with a provider, device, or plugin diagnostic.
+
+Frames are limited to 1 MiB. Use paging for large provider or playlist results.
+Jobs are process-local, bounded, and retained for 15 minutes after completion.
+cliamp cancels them during an orderly server shutdown. They are not available
+after a restart.

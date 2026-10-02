@@ -2,17 +2,23 @@ package model
 
 import (
 	"strings"
+	"sync/atomic"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
 
-	"cliamp/history"
-	"cliamp/luaplugin"
-	"cliamp/player"
-	"cliamp/playlist"
-	"cliamp/theme"
-	"cliamp/ui"
+	"github.com/bjarneo/cliamp/external/radio"
+	"github.com/bjarneo/cliamp/favorites"
+	"github.com/bjarneo/cliamp/history"
+	"github.com/bjarneo/cliamp/luaplugin"
+	"github.com/bjarneo/cliamp/player"
+	"github.com/bjarneo/cliamp/playlist"
+	"github.com/bjarneo/cliamp/provider"
+	"github.com/bjarneo/cliamp/theme"
+	"github.com/bjarneo/cliamp/ui"
 )
+
+type openDefaultProviderBrowserMsg struct{}
 
 // applyThemeAll updates colors, spectrum styles, and model-specific styles.
 func applyThemeAll(t theme.Theme) {
@@ -24,7 +30,9 @@ func applyThemeAll(t theme.Theme) {
 // providers is the ordered list of available providers (Radio, Navidrome, Spotify, Jellyfin, etc.).
 // defaultProvider is the config key of the provider to select initially.
 // localProv is an optional direct reference to the local provider for write ops.
-func New(p player.Engine, pl *playlist.Playlist, providers []ProviderEntry, defaultProvider string, localProv playlist.Provider, themes []theme.Theme, luaMgr *luaplugin.Manager, cs ConfigSaver) Model {
+// favs and hist are the favorites and history stores that the local provider
+// also reads. Each can be nil.
+func New(p player.Engine, pl *playlist.Playlist, providers []provider.Entry, defaultProvider string, localProv playlist.Provider, favs *favorites.Store, hist *history.Store, themes []theme.Theme, luaMgr *luaplugin.Manager, cs ConfigSaver) Model {
 	m := Model{
 		player:           p,
 		playlist:         pl,
@@ -33,17 +41,25 @@ func New(p player.Engine, pl *playlist.Playlist, providers []ProviderEntry, defa
 		seekStepLarge:    30 * time.Second,
 		plVisible:        5,
 		eqPresetIdx:      -1, // custom until a preset is selected
+		eqCustomBands:    p.EQBands(),
 		themes:           themes,
 		themeIdx:         -1, // Default (ANSI)
 		localProvider:    localProv,
 		providers:        providers,
 		navBrowser:       navBrowserState{},
 		luaMgr:           luaMgr,
-		historyStore:     history.New(),
+		historyStore:     hist,
+		favStore:         favs,
 		showAlbumHeaders: false,
+		reports:          &reportQueue{},
 	}
+	m.refreshFavSet()
 	if luaMgr != nil {
 		m.pluginEmit = &pluginEmitState{}
+		if luaMgr.PluginCount() > 0 {
+			m.pluginState = new(atomic.Pointer[PluginState])
+			m.publishPluginState()
+		}
 	}
 	m.termTitle = initialTerminalTitleState()
 	// Select the default provider pill.
@@ -62,10 +78,30 @@ func New(p player.Engine, pl *playlist.Playlist, providers []ProviderEntry, defa
 	return m
 }
 
+// SetCustomEQBands sets the persistent Custom curve without selecting it.
+func (m *Model) SetCustomEQBands(bands [10]float64) {
+	m.eqCustomBands = bands
+}
+
 // SetVisVolumeLinked controls whether the visualizer scales samples by the
 // current volume before FFT analysis, making bar height follow volume.
 func (m *Model) SetVisVolumeLinked(linked bool) {
 	m.visVolumeLinked = linked
+}
+
+// SetVisRows sets the visualizer height in rows for the full layout tier.
+// Zero keeps the built-in default. The layout caps it at what the terminal
+// can spare.
+func (m *Model) SetVisRows(rows int) {
+	m.visRows = rows
+	m.recomputeLayout()
+}
+
+// SetPadding sets the frame padding in columns left and right and in rows
+// above and below. The layout clamps it to the terminal size.
+func (m *Model) SetPadding(h, v int) {
+	m.paddingH, m.paddingV, m.paddingSet = h, v, true
+	m.recomputeLayout()
 }
 
 // findProviderWith returns the first registered provider that satisfies the
@@ -84,16 +120,87 @@ func (m *Model) findProviderWith(check func(playlist.Provider) bool) playlist.Pr
 	return nil
 }
 
+// findCapable returns the first provider that is a T and that ok accepts,
+// with the name to show for it. Like findProviderWith, it prefers the active
+// provider. With no match, it returns the zero T.
+func findCapable[T any](m *Model, ok func(T) bool) (T, string) {
+	if c, is := m.provider.(T); is && ok(c) {
+		return c, m.provider.Name()
+	}
+	for _, pe := range m.providers {
+		if c, is := pe.Provider.(T); is && ok(c) {
+			return c, pe.Name
+		}
+	}
+	var zero T
+	return zero, ""
+}
+
 // SetAutoPlay makes the player start playback immediately on Init.
 func (m *Model) SetAutoPlay(v bool) { m.autoPlay = v }
 
 // SetLowPower lowers UI cadences without affecting normal mode.
 func (m *Model) SetLowPower(v bool) { m.lowPower = v }
 
-// SetCompact enables compact mode which caps the frame width at 80 columns.
-func (m *Model) SetCompact(v bool) {
-	m.compact = v
+// SetHeadless runs the Model with no screen, as cliamp --daemon does. View
+// returns an empty view, Init does not ask for the window size, and the tick
+// uses the low-power cadence. The layout is the one of an 80x24 terminal
+// with the focus on the playlist, so the visualizer keeps a size and stays
+// in the layout for spectrum.get.
+func (m *Model) SetHeadless(v bool) {
+	m.headless = v
+	if v {
+		m.lowPower = true
+		m.termTitle.introActive = false
+		m.focus = focusPlaylist
+		m.recomputeLayout()
+	}
+}
+
+// SetVisualizer60FPS enables the 60 FPS visualizer cadence while it is active.
+func (m *Model) SetVisualizer60FPS(v bool) { m.visualizer60FPS = v }
+
+// SetSimplified enables the sparse playback view without a visualizer.
+func (m *Model) SetSimplified(v bool) {
+	m.simplified = v
+	if v {
+		m.fullVis = false
+	}
 	m.refreshChrome()
+	m.normalizeMainFocus()
+}
+
+// SetHideHelpBar hides the key-binding hint bar and gives the row back to the
+// body. The full keymap stays reachable with "?".
+func (m *Model) SetHideHelpBar(v bool) {
+	m.hideHelpBar = v
+	m.refreshChrome()
+}
+
+// SetHideSettingsPane closes the settings pane beside the playlist, returning
+// the playback screen to its single-column layout where the same settings are
+// drawn as stacked rows.
+func (m *Model) SetHideSettingsPane(v bool) {
+	m.hideSettings = v
+	m.refreshChrome()
+}
+
+// SetShowMetadata expands the highlighted-track details below Settings.
+func (m *Model) SetShowMetadata(v bool) {
+	m.showMetadata = v
+	m.refreshChrome()
+}
+
+// SetExpanded starts the UI in the expanded playlist height, the state the
+// Ctrl+X binding toggles. It sets the same field toggleExpandedView does and
+// takes no view into account: usesSimplifiedLayout() is transient (it drops as
+// soon as the provider or an overlay takes focus), and recomputeLayout already
+// ignores the height while it holds, so a guard here would only make the flag
+// differ from the key.
+func (m *Model) SetExpanded(v bool) {
+	m.heightExpanded = v
+	m.applyHeightMode()
+	m.adjustScroll()
 }
 
 // SetInitialDirectory sets the initial directory for the file browser.
@@ -113,7 +220,7 @@ func (m *Model) SetSeekStepLarge(d time.Duration) {
 
 // SetTheme finds a theme by name and applies it. Returns true if found.
 func (m *Model) SetTheme(name string) bool {
-	if name == "" || strings.EqualFold(name, "default") {
+	if theme.IsDefaultName(name) {
 		m.themeIdx = -1
 		applyThemeAll(theme.Default())
 		return true
@@ -132,7 +239,7 @@ func (m *Model) SetTheme(name string) bool {
 // Returns true if a valid mode name was recognized. Does not modify state
 // if the name is not found, matching the SetTheme guard pattern.
 func (m *Model) SetVisualizer(name string) bool {
-	mode, ok := ui.StringToVisModeExact(name)
+	mode, ok := m.vis.ModeByName(name)
 	if !ok {
 		return false
 	}
@@ -154,8 +261,8 @@ func (m *Model) VisualizerName() string {
 }
 
 // RegisterLuaVisualizers adds Lua visualizer plugins to the visualizer cycle.
-func (m *Model) RegisterLuaVisualizers(names []string, renderer ui.LuaVisRenderer) {
-	m.vis.RegisterLuaVisualizers(names, renderer)
+func (m *Model) RegisterLuaVisualizers(names []string, host ui.LuaVisHost) {
+	m.vis.RegisterLuaVisualizers(names, host)
 }
 
 // SetResume registers a path+position to seek to when that track first plays.
@@ -164,17 +271,46 @@ func (m *Model) SetResume(path string, secs int) {
 	m.resume.secs = secs
 }
 
+// SetResumeSaver enables continuous playback-context persistence.
+func (m *Model) SetResumeSaver(save ResumeSaver) {
+	m.resumeSaver = save
+	if save != nil && m.playlist != nil {
+		// Updating entries preserves selection, shuffle order, and queued playback.
+		for i, track := range playlist.WithPlaybackContext(m.playlist.Tracks()) {
+			m.playlist.SetTrack(i, track)
+		}
+	}
+}
+
+// SetInitialTrack selects the restored track without starting playback.
+func (m *Model) SetInitialTrack(index int) {
+	if m.playlist == nil || index < 0 || index >= m.playlist.Len() {
+		return
+	}
+	m.playlist.SetIndex(index)
+	m.plCursor = index
+	tracks := m.playlist.Tracks()
+	m.setPlaybackContext(tracks, index)
+	m.setHeaderStateFromTracks(tracks)
+}
+
 // ResumePlaylist loads a playlist into the model for session resume.
 func (m *Model) ResumePlaylist(name string, tracks []playlist.Track) {
-	m.playlist.Replace(tracks)
+	m.retireTracksPaging()
+	m.replacePlaylist(tracks)
 	m.setHeaderStateFromTracks(tracks)
-	m.loadedPlaylist = name
+	m.SetLoadedPlaylist(name)
 }
 
 // ResumeState returns the track path, playback position, and playlist name captured at exit.
 // Called after prog.Run() returns (player already closed).
 func (m Model) ResumeState() (path string, secs int, playlist string) {
 	return m.exitResume.path, m.exitResume.secs, m.exitResume.playlist
+}
+
+// ResumeContext returns the complete list the active track was selected from.
+func (m Model) ResumeContext() ([]playlist.Track, int) {
+	return cloneTracks(m.exitResume.context), m.exitResume.contextIndex
 }
 
 // ThemeName returns the current theme name.
@@ -185,14 +321,24 @@ func (m Model) ThemeName() string {
 	return m.themes[m.themeIdx].Name
 }
 
-// Init starts the tick timer and requests the terminal size.
+// Init starts the tick timer and requests the terminal size. A headless
+// Model skips the size and the provider pane, which only a screen shows.
+// main.go configures the Model after New, so app.start publishes the plugin
+// state again before its hooks run.
 func (m Model) Init() tea.Cmd {
-	if m.luaMgr != nil {
-		m.luaMgr.Emit(luaplugin.EventAppStart, nil)
-	}
-	cmds := []tea.Cmd{tickCmd(), func() tea.Msg { return tea.RequestWindowSize() }}
-	if m.provider != nil {
-		cmds = append(cmds, fetchPlaylistsCmd(m.provider))
+	m.emitPlugin(luaplugin.EventAppStart, nil)
+	cmds := []tea.Cmd{tickCmd()}
+	if !m.headless {
+		cmds = append(cmds, func() tea.Msg { return tea.RequestWindowSize() })
+		if m.provider != nil {
+			// Init has a value receiver, so it must not advance a request generation
+			// on its private model copy. The initial zero generation is current until
+			// the user starts another provider request.
+			cmds = append(cmds, fetchPlaylistsCmd(m.provider, m.requests.provider))
+		}
+		if m.openDefaultProviderOnce {
+			cmds = append(cmds, func() tea.Msg { return openDefaultProviderBrowserMsg{} })
+		}
 	}
 	if len(m.pendingURLs) > 0 {
 		cmds = append(cmds, resolveRemoteCmd(m.pendingURLs, m.autoPlay))
@@ -202,3 +348,29 @@ func (m Model) Init() tea.Cmd {
 	}
 	return tea.Batch(cmds...)
 }
+
+// refreshFavSet rebuilds the in-memory set of favorited paths from the
+// favorites store. Call after every toggle and on init so the render path
+// never hits disk.
+func (m *Model) refreshFavSet() {
+	m.favSet = nil
+	if m.favStore == nil {
+		return
+	}
+	tracks, err := m.favStore.Tracks()
+	if err != nil || len(tracks) == 0 {
+		return
+	}
+	m.favSet = make(map[string]struct{}, len(tracks))
+	for _, t := range tracks {
+		m.favSet[t.Path] = struct{}{}
+	}
+}
+
+// SetRadioFavorites shares the Radio provider's local station favorites store.
+func (m *Model) SetRadioFavorites(favorites *radio.Favorites) {
+	m.radioFavorites = favorites
+}
+
+// SetDownloadsDirectory selects the destination for saved tracks.
+func (m *Model) SetDownloadsDirectory(dir string) { m.downloadsDirectory = dir }

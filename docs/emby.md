@@ -1,8 +1,8 @@
 # Emby
 
-cliamp can stream music directly from an Emby server using Emby's authenticated HTTP API. The integration exposes your music libraries as a flat album list in the normal provider pane, following the same shape as the Jellyfin and Plex providers.
+Use cliamp to stream music from an Emby server through Emby's authenticated HTTP API. The provider pane shows music libraries as a flat album list, like the Plex provider.
 
-> **Quick start:** run `cliamp setup` for a guided TUI that lets you pick API-key or username+password auth, validates against `/System/Info`, and writes the `[emby]` block for you. Manual setup steps are below.
+> **Quick start:** Run `cliamp setup`. Select API-key or username+password authentication. The TUI validates `/System/Info` and writes the `[emby]` block. Manual steps follow.
 
 ## Prerequisites
 
@@ -27,14 +27,14 @@ password = "your_password_here"
 | Key | Description |
 |-----|-------------|
 | `url` | Base URL of your Emby server |
-| `user` | Emby username — used for password login, and to select the matching account when using an API key |
-| `password` | Emby password for password-based login |
-| `token` | Emby API key — alternative to username/password |
+| `user` | Emby username. Use it for password login and to select the account for an API key. |
+| `password` | Emby password for password login |
+| `token` | Emby API key. Use it instead of a username and password. |
 | `user_id` | Optional Emby user id to skip discovery |
 
 ## Usage
 
-Once configured, **Emby** appears as a provider alongside Radio, Navidrome, Plex, Jellyfin, Spotify, and the YouTube providers.
+After configuration, **Emby** appears in the provider list.
 
 To start cliamp with Emby selected:
 
@@ -42,26 +42,41 @@ To start cliamp with Emby selected:
 cliamp --provider emby
 ```
 
-Or set it in config:
+Or set the provider in configuration:
 
 ```toml
 provider = "emby"
 ```
 
-The provider exposes a flat list of albums:
+The provider shows a flat album list:
 
 ```text
 Artist — Album Title (Year)
 ```
 
-Select an album to load its tracks, then play as normal. Press `E` anywhere in the UI to switch to Emby quickly.
+Select an album to load its tracks. Press `E` to select Emby.
+
+When Emby is the default provider, cliamp remembers the most recently played Emby track, its playback position, and the album or track list it was chosen from. cliamp saves this state when a track starts, every two seconds during confirmed playback, and during a normal exit.
+
+On the next launch with no explicit files, URLs, or playlist, cliamp restores that list with the last track selected. Press `Enter` to continue from the saved position. An `auto_play` setting is ignored for a restored list. Saved stream URLs use the current authentication when playback or preloading starts. This works as it does for [Jellyfin](jellyfin.md#usage).
+
+Press `N` in the Emby pane to open the Emby browser. Select **By Album**, **By Artist**, or **By Artist / Album**. In **By Artist / Album**, the artists are in alphabetical order. Select an artist to open the albums of that artist. Select an album to open its songs.
 
 ## How it works
 
-cliamp authenticates with either a configured API key or the supplied username/password, resolves the active Emby user, enumerates music library views, fetches album items from those views, then fetches track items for the selected album. Playback uses Emby's authenticated download endpoint, so the existing cliamp HTTP pipeline can stream the result directly.
+cliamp authenticates with an API key or the supplied username and password. It resolves the active Emby user and lists the music library views. It reads the albums of each view in pages of 500 and derives an alphabetical artist index from them. Then it gets the tracks for the selected album. Playback uses Emby's authenticated download endpoint and streams through the cliamp HTTP pipeline.
+
+## Troubleshooting
+
+### macOS: `dial tcp ... connect: no route to host`
+
+If cliamp reports `no route to host` for an Emby server on the LAN, but `curl` works with the same URL, macOS likely denies Local Network access to the app. cliamp then adds a hint to the error.
+
+Fix: Open **System Settings > Privacy & Security > Local Network**. Enable access for the terminal app, then restart cliamp. For more steps, see [Plex troubleshooting](plex.md#troubleshooting).
 
 ## Known limitations
 
-- **Album list is flat**: no artist drill-down yet
-- **Token-based access**: store the API key carefully
-- **API key user selection**: Emby API keys are server-level (no "current user"). When no `user` is configured, cliamp picks the first user returned by `/Users`. On single-user servers this is always correct; on multi-user servers, set `user_id` explicitly in `[emby]` to target a specific account.
+- **Playback reporting**: cliamp reports now-playing status, progress, and stop
+  events to Emby, so the server can track play activity and history.
+- **Token-based access**: Store the API key safely.
+- **API key user selection**: Emby API keys apply to the server and have no "current user". Without `user`, cliamp selects the first user returned by `/Users`. This is correct for a single-user server. On a multi-user server, set `user_id` in `[emby]` to select an account.

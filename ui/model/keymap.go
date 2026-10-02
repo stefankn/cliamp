@@ -3,6 +3,7 @@ package model
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	tea "charm.land/bubbletea/v2"
 )
@@ -12,120 +13,113 @@ import (
 type keymapEntry struct {
 	key, action string
 	divider     bool
+	// run is the key that Enter sends to run the entry. When run is empty,
+	// Enter shows hint instead.
+	run, hint string
 }
 
-// keymapEntries is the full list of keybindings shown in the keymap overlay.
-var keymapEntries = []keymapEntry{
-	{key: "Space", action: "Play / Pause"},
-	{key: "s", action: "Stop"},
-	{key: "> .", action: "Next track"},
-	{key: "< ,", action: "Previous track"},
-	{key: "← →", action: "Seek ±5s"},
-	{key: "Shift+← →", action: "Seek ±large step"},
-	{key: "Nj", action: "Seek to N×10% of track (e.g. 7j = 70%)"},
-	{key: "+ -", action: "Volume up/down"},
-	{key: "] [", action: "Speed up/down (±0.25x)"},
-	{key: "z", action: "Toggle shuffle"},
-	{key: "r", action: "Cycle repeat"},
-	{key: "m", action: "Toggle mono"},
-	{key: "e", action: "Cycle EQ preset"},
-	{key: "t", action: "Choose theme"},
-	{key: "v", action: "Cycle visualizer"},
-	{key: "Ctrl+V", action: "Choose visualizer"},
-	{key: "V", action: "Full-screen visualizer"},
-	{key: "↑ ↓", action: "Playlist scroll / EQ adjust (wraps around)"},
-	{key: "PgUp PgDn / Ctrl+U D", action: "Scroll playlist/browser by page"},
-	{key: "Home End / g G", action: "Go to top/end of playlist/browser"},
-	{key: "Shift+↑ ↓", action: "Move track up/down"},
-	{key: "h l", action: "EQ cursor left/right"},
-	{key: "Enter", action: "Play selected track"},
-	{key: "a", action: "Toggle queue (play next)"},
-	{key: "A", action: "Queue manager"},
-	{key: "x", action: "Remove selected track from playlist"},
-	{key: "o", action: "Open file browser"},
-	{key: "N", action: "Navidrome browser"},
-	{key: "L", action: "Browse local playlists"},
-	{key: "R", action: "Open radio provider"},
-	{key: "S", action: "Open Spotify provider"},
-	{key: "P", action: "Open Plex provider"},
-	{key: "Y", action: "Open YouTube provider"},
-	{key: "C", action: "Open SoundCloud provider"},
-	{key: "M", action: "Open NetEase provider"},
-	{key: "J", action: "Open Jellyfin provider"},
-	{key: "E", action: "Open Emby provider"},
-	{key: "Ctrl+J", action: "Jump to time"},
-	{key: "p", action: "Playlist manager"},
-	{key: "Ctrl+H", action: "Toggle album headers"},
-	{key: "i", action: "Track info / metadata"},
-	{key: "Ctrl+S", action: "Save/download track to ~/Music"},
-	{key: "Ctrl+X", action: "Expand/collapse view"},
-	{key: "/", action: "Filter/search list"},
-	{key: "f", action: "Toggle bookmark ★ (or favorite station in radio)"},
-	{key: "Ctrl+F", action: "Search (active provider or YouTube)"},
-	{key: "u", action: "Load URL (stream/playlist)"},
-	{key: "d", action: "Audio device picker"},
-	{key: "y", action: "Show lyrics"},
-	{key: "Tab", action: "Toggle focus"},
-	{key: "Esc", action: "Back to provider"},
-	{key: "? Ctrl+K", action: "This keymap"},
-	{key: "q", action: "Quit"},
+// keyCodes holds the named keys that commands and plugins bind.
+var keyCodes = map[string]rune{
+	"enter": tea.KeyEnter, "esc": tea.KeyEscape, "tab": tea.KeyTab, "space": tea.KeySpace,
+	"backspace": tea.KeyBackspace, "delete": tea.KeyDelete, "insert": tea.KeyInsert,
+	"up": tea.KeyUp, "down": tea.KeyDown, "left": tea.KeyLeft, "right": tea.KeyRight,
+	"home": tea.KeyHome, "end": tea.KeyEnd, "pgup": tea.KeyPgUp, "pgdown": tea.KeyPgDown,
+	"f1": tea.KeyF1, "f2": tea.KeyF2, "f3": tea.KeyF3, "f4": tea.KeyF4, "f5": tea.KeyF5, "f6": tea.KeyF6,
+	"f7": tea.KeyF7, "f8": tea.KeyF8, "f9": tea.KeyF9, "f10": tea.KeyF10, "f11": tea.KeyF11, "f12": tea.KeyF12,
 }
 
-// coreReservedKeys is the set of keys owned by cliamp's global UI handler.
-// Plugins are refused registration for any key in this set. Kept as a plain
-// slice so it's obvious at a glance which strings belong here; every entry
-// is in Bubbletea's `msg.String()` form (lowercase, ctrl+ prefix, etc.).
-//
-// This must be kept in sync with handleKey() in keys.go. If you add or remove
-// a case there, update this list — the TestReservedKeys test in keymap_test.go
-// guards against drift.
-var coreReservedKeys = []string{
-	// Global quit / escape.
-	"q", "ctrl+c", "esc", "backspace", "b",
-
-	// Playback.
-	"space", "s", ">", ".", "<", ",",
-	"left", "right", "shift+left", "shift+right",
-	"+", "=", "-", "]", "[",
-	"f",
-
-	// Percentage seek primes on digits 0-9 and consumes the following `j`.
-	"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "j",
-
-	// Navigation and focus.
-	"up", "k", "down", "ctrl+n", "ctrl+p",
-	"shift+up", "shift+down",
-	"pgup", "pgdown", "ctrl+u", "ctrl+d",
-	"g", "G", "home", "end",
-	"enter", "tab", "h", "l",
-
-	// Features.
-	"r", "z", "m", "e", "a", "A", "ctrl+h",
-	"ctrl+s", "S", "/", "ctrl+f",
-	"ctrl+j", "J", "E", "p", "t", "i", "y", "o", "u",
-	"N", "L", "R", "P", "Y", "C", "M",
-	"v", "V", "ctrl+v", "ctrl+x", "x", "d", "ctrl+k", "?",
-	"ctrl+r",
+// keyPressFor builds a key press whose String value is key, such as "a",
+// "ctrl+x" or "shift+left". It returns false when it cannot build one.
+func keyPressFor(key string) (tea.KeyPressMsg, bool) {
+	var msg tea.KeyPressMsg
+	name := key
+	for {
+		mod, rest, found := strings.Cut(name, "+")
+		if !found || mod == "" || rest == "" {
+			break
+		}
+		switch mod {
+		case "ctrl":
+			msg.Mod |= tea.ModCtrl
+		case "alt":
+			msg.Mod |= tea.ModAlt
+		case "shift":
+			msg.Mod |= tea.ModShift
+		default:
+			return tea.KeyPressMsg{}, false
+		}
+		name = rest
+	}
+	if code, ok := keyCodes[name]; ok {
+		msg.Code = code
+		if code == tea.KeySpace && msg.Mod == 0 {
+			msg.Text = " "
+		}
+	} else if r, size := utf8.DecodeRuneInString(name); r != utf8.RuneError && size == len(name) {
+		msg.Code = r
+		if msg.Mod == 0 {
+			msg.Text = name
+		}
+	} else {
+		return tea.KeyPressMsg{}, false
+	}
+	return msg, msg.String() == key
 }
 
-// ReservedKeys returns a fresh copy of the core-reserved key set. Handed to
-// the Lua plugin manager at startup so it can reject conflicting plugin binds.
+// ReservedKeys returns a fresh copy of every key described by commandRegistry.
+// It is handed to the Lua plugin manager at startup so plugins cannot shadow
+// a core action or an active text field.
 func ReservedKeys() map[string]bool {
-	out := make(map[string]bool, len(coreReservedKeys))
-	for _, k := range coreReservedKeys {
-		out[k] = true
+	out := make(map[string]bool)
+	for _, command := range commandRegistry {
+		for _, key := range command.Keys {
+			out[key] = true
+		}
 	}
 	return out
 }
 
-// buildKeymapEntries returns the core keybindings plus any plugin-registered
-// binds that supplied a description. Plugins appear under a divider row.
-// Only called when the overlay is opened; the result is cached on keymap.entries
+// buildKeymapEntries starts with commands for the screen that opened Ctrl+K,
+// then lists global player and library commands. The result is cached on open
 // so navigation (which calls keymapCount many times per frame) is allocation-free.
 func (m Model) buildKeymapEntries() []keymapEntry {
-	out := make([]keymapEntry, 0, len(keymapEntries)+4)
-	out = append(out, keymapEntries...)
-	if m.luaMgr == nil {
+	out := make([]keymapEntry, 0, len(commandRegistry)+6)
+	seen := make(map[string]bool)
+	mode, screen := m.keymapContext()
+	add := func(command commandSpec) {
+		label := command.label(m)
+		id := command.KeyLabel + "\x00" + label
+		if seen[id] {
+			return
+		}
+		seen[id] = true
+		entry := keymapEntry{key: command.KeyLabel, action: label}
+		switch run := command.runKey(); {
+		case run == "":
+			entry.hint = "Close the keymap. Then press " + command.KeyLabel + "."
+		case command.Mode&mode == 0:
+			entry.hint = label + " is not available in " + screen + "."
+		default:
+			entry.run = run
+		}
+		out = append(out, entry)
+	}
+
+	if mode != commandModeMain {
+		out = append(out, keymapEntry{action: "— current: " + screen + " —", divider: true})
+		for _, command := range commandRegistry {
+			if command.Mode != commandModeAny && (command.Keymap || command.ContextHelp) && command.enabled(m) && command.Mode&mode != 0 {
+				add(command)
+			}
+		}
+		out = append(out, keymapEntry{action: "— player & library —", divider: true})
+	}
+	for _, command := range commandRegistry {
+		if command.Keymap && command.enabled(m) {
+			add(command)
+		}
+	}
+	if mode != commandModeMain || m.luaMgr == nil {
 		return out
 	}
 	binds := m.luaMgr.KeyBindings()
@@ -138,38 +132,61 @@ func (m Model) buildKeymapEntries() []keymapEntry {
 		if b.Plugin != "" {
 			label += "  (" + b.Plugin + ")"
 		}
-		out = append(out, keymapEntry{key: b.Key, action: label})
+		out = append(out, keymapEntry{key: b.Key, action: label, run: b.Key})
 	}
 	return out
 }
 
-func (m *Model) keymapCount() int {
-	if m.keymap.searching || m.keymap.search != "" {
-		return len(m.keymap.filtered)
-	}
-	return len(m.keymap.entries)
+// keymapContext returns the command context that the keymap lists: the one
+// under the keymap itself.
+func (m Model) keymapContext() (commandMode, string) {
+	m.keymap.visible = false
+	return m.commandContext()
 }
 
-func (m *Model) keymapHelpLine() string {
-	if m.keymap.searching {
-		return helpKey("Enter", "Confirm ") + helpKey("Esc", "Cancel ") + helpKey("Type", "Filter")
+// commandContext returns the command mode and the screen name of what owns
+// the keys: the top overlay, or else the focused control of the main screen.
+// The help line and the keymap both use it.
+func (m Model) commandContext() (commandMode, string) {
+	if spec, ok := m.topOverlay(); ok && spec.context != nil {
+		return spec.context(&m)
 	}
-	return helpKey("↓↑", "Scroll ") + helpKey("PgUp/Dn", "Page ") +
-		helpKey("Home/End", "Jump ") + helpKey("/", "Filter ") + helpKey("Esc", "Close")
+
+	switch m.focus {
+	case focusProvider:
+		if m.provSearch.active {
+			return commandModeProviderSearch, "Provider Filter"
+		}
+		return commandModeProvider, "Provider"
+	case focusEQ:
+		return commandModeEQ, "Equalizer"
+	case focusVolume:
+		return commandModeVolume, "Volume"
+	case focusShuffle:
+		return commandModeShuffle, "Shuffle"
+	case focusRepeat:
+		return commandModeRepeat, "Repeat"
+	case focusSpeed:
+		return commandModeSpeed, "Speed"
+	case focusProvPill:
+		return commandModeProviderPill, "Source"
+	default:
+		return commandModeMain, "Playlist"
+	}
+}
+
+func (m *Model) keymapCount() int {
+	return m.keymap.viewCount(len(m.keymap.entries))
 }
 
 // keymapHeaderLine renders the keymap's single-line header for the playlist
 // region: the filter prompt while searching/filtered, otherwise a labeled
 // separator with the match count.
 func (m Model) keymapHeaderLine() string {
-	if m.keymap.searching || m.keymap.search != "" {
-		return filterCountHeader(m.keymap.search, fmt.Sprintf("%d/%d", m.keymapCount(), len(m.keymap.entries)))
+	if m.keymap.isFiltered() {
+		return m.filterHeader("Filter: Keymap", "keymap", m.keymap.filter, fmt.Sprintf("%d/%d", m.keymapCount(), len(m.keymap.entries)))
 	}
-	return sepHeaderN("Keymap", m.keymap.cursor+1, len(m.keymap.entries))
-}
-
-func (m *Model) keymapVisible() int {
-	return m.effectivePlaylistVisible()
+	return sepHeaderN("Keymap", m.keymap.cursor+1, len(m.keymap.entries), m.layout.panelWidth)
 }
 
 // keymapMaybeAdjustScroll keeps the cursor visible in the current keymap window.
@@ -180,188 +197,120 @@ func (m *Model) keymapMaybeAdjustScroll(visible int) {
 // openKeymap resets the keymap state and shows it. Snapshots plugin bindings
 // once so the render/navigation code doesn't re-query the plugin manager.
 func (m *Model) openKeymap() {
-	m.keymap.searching = false
-	m.keymap.search = ""
-	m.keymap.filtered = nil
-	m.keymap.cursor = 0
-	m.keymap.scroll = 0
+	m.keymap.filterList = filterList{}
 	m.keymap.entries = m.buildKeymapEntries()
 	m.keymap.visible = true
 	// The keymap now renders in the playlist region; recompute chrome so its
 	// header/help are reflected in the visible-row budget, then fit the cursor.
 	m.refreshChrome()
 	m.applyHeightMode()
-	m.keymapMaybeAdjustScroll(m.keymapVisible())
+	m.keymapMaybeAdjustScroll(m.effectivePlaylistVisible())
 }
 
 // closeKeymap hides the keymap, clears its filter state, and restores playlist
 // sizing after the inline header and help line are dismissed.
 func (m *Model) closeKeymap() {
 	m.keymap.visible = false
-	m.keymap.searching = false
-	m.keymap.search = ""
-	m.keymap.filtered = nil
+	m.keymap.clearFilter()
 	m.refreshChrome()
 	m.applyHeightMode()
 	m.adjustScroll()
 }
 
 func (m *Model) handleKeymapSearchKey(msg tea.KeyPressMsg) tea.Cmd {
-	switch msg.String() {
-	case "ctrl+c":
-		m.keymap.visible = false
-		return m.quit()
-	case "esc":
-		m.keymap.searching = false
-		m.keymap.search = ""
-		m.keymap.filtered = nil
-		m.keymap.cursor = m.keymap.savedCursor
-		m.keymap.scroll = m.keymap.savedScroll
-		return nil
-	case "enter":
-		m.keymap.searching = false
-		if m.keymap.search == "" {
-			m.keymap.cursor = m.keymap.savedCursor
-			m.keymap.scroll = m.keymap.savedScroll
-		}
-		return nil
-	case "down":
-		m.keymap.searching = false
-		if m.keymapCount() > 0 {
-			m.keymap.cursor = 0
-			m.keymapMaybeAdjustScroll(m.keymapVisible())
-		}
-		return nil
-	case "backspace":
-		if m.keymap.search != "" {
-			m.keymap.search = removeLastRune(m.keymap.search)
-			m.updateKeymapFilter()
-		} else {
-			m.keymap.searching = false
-			m.keymap.cursor = m.keymap.savedCursor
-			m.keymap.scroll = m.keymap.savedScroll
-		}
-		return nil
-	case "space":
-		m.keymap.search += " "
-		m.updateKeymapFilter()
-		return nil
-	}
-
-	if len(msg.Text) > 0 {
-		m.keymap.search += msg.Text
-		m.updateKeymapFilter()
+	if m.filterKey(&m.keymap.filterList, "keymap", msg, len(m.keymap.entries), m.updateKeymapFilter) {
+		m.keymapMaybeAdjustScroll(m.effectivePlaylistVisible())
 	}
 	return nil
 }
 
 // handleKeymapKey processes key presses while the keymap overlay is open.
 func (m *Model) handleKeymapKey(msg tea.KeyPressMsg) tea.Cmd {
-	if m.keymap.searching {
+	if m.keymap.filtering {
 		return m.handleKeymapSearchKey(msg)
 	}
 
-	switch msg.String() {
-	case "ctrl+c":
-		m.keymap.visible = false
-		return m.quit()
-
+	key := msg.String()
+	if (key == "up" || key == "k") && m.keymap.filter != "" && m.keymap.cursor == 0 {
+		m.keymap.filtering = true
+		return nil
+	}
+	visible := m.effectivePlaylistVisible()
+	if stepListCursor(key, &m.keymap.cursor, m.keymapCount(), visible) {
+		m.keymapMaybeAdjustScroll(visible)
+		return nil
+	}
+	switch key {
 	case "esc", "ctrl+k", "?", "q":
 		m.closeKeymap()
 
 	case "/":
-		m.keymap.savedCursor = m.keymap.cursor
-		m.keymap.savedScroll = m.keymap.scroll
-		m.keymap.searching = true
-		m.keymap.search = ""
+		m.keymap.beginFilter()
 		m.updateKeymapFilter()
 		return nil
 
-	case "up", "k":
-		if m.keymap.search != "" && m.keymap.cursor == 0 {
-			m.keymap.searching = true
-			return nil
-		}
-		count := m.keymapCount()
-		if m.keymap.cursor > 0 {
-			m.keymap.cursor--
-		} else if count > 0 {
-			m.keymap.cursor = count - 1
-		}
-		m.keymapMaybeAdjustScroll(m.keymapVisible())
-
-	case "down", "j":
-		count := m.keymapCount()
-		if m.keymap.cursor < count-1 {
-			m.keymap.cursor++
-		} else if count > 0 {
-			m.keymap.cursor = 0
-		}
-		m.keymapMaybeAdjustScroll(m.keymapVisible())
-
 	case "ctrl+x":
 		m.toggleExpandedView()
-		m.keymapMaybeAdjustScroll(m.keymapVisible())
-
-	case "pgup", "ctrl+u":
-		if m.keymap.cursor > 0 {
-			visible := m.keymapVisible()
-			m.keymap.cursor -= min(m.keymap.cursor, visible)
-			m.keymapMaybeAdjustScroll(visible)
-		}
-
-	case "pgdown", "ctrl+d":
-		count := m.keymapCount()
-		if m.keymap.cursor < count-1 {
-			visible := m.keymapVisible()
-			m.keymap.cursor = min(count-1, m.keymap.cursor+visible)
-			m.keymapMaybeAdjustScroll(visible)
-		}
-
-	case "home", "g":
-		m.keymap.cursor = 0
-		m.keymapMaybeAdjustScroll(m.keymapVisible())
-
-	case "end", "G":
-		count := m.keymapCount()
-		if count > 0 {
-			m.keymap.cursor = count - 1
-		}
-		m.keymapMaybeAdjustScroll(m.keymapVisible())
+		m.keymapMaybeAdjustScroll(m.effectivePlaylistVisible())
 
 	case "backspace", "h":
-		if m.keymap.search != "" {
-			m.keymap.search = ""
+		if m.keymap.filter != "" {
+			m.keymap.filter = ""
 			m.updateKeymapFilter()
 		} else {
 			m.closeKeymap()
 		}
 
 	case "enter", "l":
-		m.closeKeymap()
+		return m.runKeymapEntry()
 	}
 
 	return nil
 }
 
-// updateKeymapFilter rebuilds the filtered indices and clamps the cursor.
+// selectedKeymapEntry returns the entry under the keymap cursor.
+func (m *Model) selectedKeymapEntry() (keymapEntry, bool) {
+	idx, ok := m.keymap.rawIndex(m.keymap.cursor, len(m.keymap.entries))
+	if !ok {
+		return keymapEntry{}, false
+	}
+	return m.keymap.entries[idx], true
+}
+
+// runKeymapEntry runs the selected command. It closes the keymap and sends
+// the command key to handleKey, so the command acts as if the user pressed
+// the key on the screen that opened the keymap. An entry that one key press
+// cannot run keeps the keymap open and shows its hint.
+func (m *Model) runKeymapEntry() tea.Cmd {
+	entry, ok := m.selectedKeymapEntry()
+	if !ok || entry.divider {
+		return nil
+	}
+	msg, ok := keyPressFor(entry.run)
+	if !ok {
+		hint := entry.hint
+		if hint == "" {
+			hint = "Close the keymap. Then press " + entry.key + "."
+		}
+		m.status.Warning(hint, statusTTLMedium)
+		return nil
+	}
+	m.closeKeymap()
+	return m.handleKey(msg)
+}
+
+// updateKeymapFilter rebuilds the filtered indices and clamps the cursor. An
+// empty query keeps every entry. A query skips the section dividers.
 func (m *Model) updateKeymapFilter() {
-	m.keymap.filtered = nil
-	m.keymap.cursor = 0
-	m.keymap.scroll = 0
-	if m.keymap.search == "" {
-		return
-	}
-	query := strings.ToLower(m.keymap.search)
-	for i, e := range m.keymap.entries {
-		if e.divider {
-			continue
+	query := strings.ToLower(m.keymap.filter)
+	m.keymap.recompute(len(m.keymap.entries), func(i int) bool {
+		e := m.keymap.entries[i]
+		if query == "" {
+			return true
 		}
-		if strings.Contains(strings.ToLower(e.key), query) ||
-			strings.Contains(strings.ToLower(e.action), query) {
-			m.keymap.filtered = append(m.keymap.filtered, i)
-		}
-	}
+		return !e.divider && (strings.Contains(strings.ToLower(e.key), query) ||
+			strings.Contains(strings.ToLower(e.action), query))
+	})
 }
 
 // renderKeymapList renders the keymap entries for the playlist region while the
@@ -373,19 +322,10 @@ func (m Model) renderKeymapList() string {
 		return ""
 	}
 
-	entries := m.keymap.entries
-	var visible []keymapEntry
-	if m.keymap.search != "" {
-		for _, i := range m.keymap.filtered {
-			visible = append(visible, entries[i])
-		}
-	} else {
-		visible = entries
-	}
-
+	visible := shownRows(&m.keymap.filterList, m.keymap.entries)
 	if len(visible) == 0 {
 		msg := "(empty)"
-		if m.keymap.search != "" {
+		if m.keymap.filter != "" {
 			msg = "No matches"
 		}
 		return strings.Join(fitLines([]string{dimStyle.Render("  " + msg)}, budget), "\n")
@@ -399,11 +339,11 @@ func (m Model) renderKeymapList() string {
 			continue
 		}
 		line := fmt.Sprintf("%-10s %s", entry.key, entry.action)
-		if m.keymap.searching {
+		if m.keymap.filtering {
 			lines = append(lines, dimStyle.Render("  "+line))
 		} else {
 			lines = append(lines, cursorLine(line, i == m.keymap.cursor))
 		}
 	}
-	return strings.Join(lines, "\n")
+	return strings.Join(padLines(lines, budget, len(lines)), "\n")
 }

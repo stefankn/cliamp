@@ -1,8 +1,8 @@
 # Jellyfin
 
-cliamp can stream music directly from a Jellyfin server using Jellyfin's authenticated HTTP API. The first integration exposes your music libraries as a flat album list in the normal provider pane, following the same shape as the Plex provider.
+Use cliamp to stream music from a Jellyfin server through Jellyfin's authenticated HTTP API. Jellyfin opens in an artists-first hierarchy by default: artist, then album, then songs.
 
-> **Quick start:** run `cliamp setup` for a guided TUI that lets you pick API-token or username+password auth, validates against `/Users/Me`, and writes the `[jellyfin]` block for you. Manual setup steps are below.
+> **Quick start:** Run `cliamp setup`. Select API-token or username+password authentication. The TUI validates `/Users/Me` and writes the `[jellyfin]` block. Manual steps follow.
 
 ## Prerequisites
 
@@ -28,13 +28,13 @@ password = "your_password_here"
 |-----|-------------|
 | `url` | Base URL of your Jellyfin server |
 | `user` | Jellyfin username for password-based login |
-| `password` | Jellyfin password for password-based login |
-| `token` | Optional Jellyfin API token instead of username/password |
+| `password` | Jellyfin password for password login |
+| `token` | Optional Jellyfin API token. Use it instead of a username and password. |
 | `user_id` | Optional Jellyfin user id to skip discovery |
 
 ## Usage
 
-Once configured, **Jellyfin** appears as a provider alongside Radio, Navidrome, Plex, Spotify, and the YouTube providers.
+After configuration, **Jellyfin** appears in the provider list.
 
 To start cliamp with Jellyfin selected:
 
@@ -42,26 +42,34 @@ To start cliamp with Jellyfin selected:
 cliamp --provider jellyfin
 ```
 
-Or set it in config:
+Or set the provider in configuration:
 
 ```toml
 provider = "jellyfin"
 ```
 
-The provider currently exposes a flat list of albums:
+Jellyfin opens directly in **By Artist / Album** mode. Artists are listed alphabetically; selecting one opens their albums, and selecting an album opens its songs.
 
-```text
-Artist - Album Title (Year)
-```
+When Jellyfin is the default provider, cliamp remembers the most recently played Jellyfin track, its playback position, and the complete album or track list it was chosen from. Queued tracks retain their own source context, including duplicate entries. State is saved when a track starts, every two seconds during confirmed playback, and during a normal exit. `q` and `Ctrl+C` save the current position; terminal closure or an abrupt exit restores the last checkpoint. Buffering and unfinished seeks do not overwrite it with an unconfirmed position.
 
-Select an album to load its tracks, then play as normal.
+On the next launch with no explicit files, URLs, or playlist, cliamp restores that context with the last track selected. Press `Enter` to continue from the saved position. An explicitly configured `auto_play` setting is ignored for restored context so reopening cliamp stays silent. Saved stream URLs use current authentication when playback or preloading starts, including username-and-password sessions, without waiting for authentication during restoration.
+
+Press `N` while browsing Jellyfin to temporarily switch to **By Album** or **By Artist**. These alternate modes apply only to the current session; the next launch without a remembered track returns to **By Artist / Album**.
 
 ## How it works
 
-cliamp authenticates with either a configured token or the supplied username/password, resolves the active Jellyfin user, enumerates music library views, fetches album items from those views, then fetches track items for the selected album. Playback uses Jellyfin's authenticated audio endpoint, so the existing cliamp HTTP pipeline can stream the result directly.
+cliamp authenticates with a configured token or the supplied username and password. It resolves the active Jellyfin user, lists music library views, derives an alphabetical artist index from the album catalog, then gets tracks for the selected album. Playback uses Jellyfin's authenticated audio endpoint and streams through the cliamp HTTP pipeline.
+
+## Troubleshooting
+
+### macOS: `dial tcp ... connect: no route to host`
+
+If cliamp reports `no route to host` for a Jellyfin server on the LAN, but `curl` works with the same URL, macOS likely denies Local Network access to the app. cliamp then adds a hint to the error.
+
+Fix: Open **System Settings > Privacy & Security > Local Network**. Enable access for the terminal app, then restart cliamp. For more steps, see [Plex troubleshooting](plex.md#troubleshooting).
 
 ## Known limitations
 
-- **Album list is flat**: no artist drill-down yet
-- **No scrobbling/write-back**: plays are not reported back to Jellyfin yet
-- **Token-based access**: store the API token carefully
+- **Playback reporting**: cliamp reports now-playing status, progress, and stop
+  events to Jellyfin, so the server can track play activity and history.
+- **Token-based access**: Store the API token safely.

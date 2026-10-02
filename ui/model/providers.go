@@ -1,20 +1,30 @@
 package model
 
 import (
+	"slices"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
 
-	"cliamp/playlist"
-	"cliamp/provider"
+	"github.com/bjarneo/cliamp/external/radio"
+	"github.com/bjarneo/cliamp/favorites"
+	"github.com/bjarneo/cliamp/history"
+	"github.com/bjarneo/cliamp/playlist"
+	"github.com/bjarneo/cliamp/provider"
 )
 
 // resetProviderNav resets provider navigation and search state to the top.
 func (m *Model) resetProviderNav() {
-	m.provCursor = 0
-	m.provScroll = 0
-	m.provLoading = true
+	nextRequest(&m.requests.provider)
+	nextRequest(&m.requests.tracks)
+	nextRequest(&m.requests.auth)
+	nextRequest(&m.requests.catalog)
+	m.tracksPaging = false
+	m.provPane.cursor = 0
+	m.provPane.scroll = 0
+	m.provPane.loading = true
 	m.provSearch.active = false
+	m.provSearch.loading = false
 	m.provSearch.query = ""
 	m.provSearch.results = nil
 	m.provSearch.cursor = 0
@@ -27,6 +37,8 @@ func (m *Model) StartInProvider() {
 	if m.provider != nil {
 		m.focus = focusProvider
 		m.resetProviderNav()
+		_, m.openDefaultProviderOnce = m.provider.(provider.DefaultBrowseModeProvider)
+		m.recomputeLayout()
 	}
 }
 
@@ -37,29 +49,292 @@ func (m *Model) switchProvider(idx int) tea.Cmd {
 	}
 	m.provPillIdx = idx
 	m.provider = m.providers[idx].Provider
-	m.providerLists = nil
-	m.provSignIn = false
+	m.provPane.lists = nil
+	m.provPane.signIn = false
 	m.catalogBatch = catalogBatchState{}
 	m.activeProviderPlaylistID = ""
 	m.resetProviderNav()
 	m.focus = focusProvider
-	return fetchPlaylistsCmd(m.provider)
+	listsCmd := m.fetchProviderPlaylists()
+	if _, ok := m.provider.(provider.DefaultBrowseModeProvider); ok {
+		return tea.Batch(listsCmd, m.openDefaultProviderBrowser())
+	}
+	return listsCmd
+}
+
+// fetchProviderPlaylists reloads the rows of the provider pane. A headless
+// Model has no pane, so it skips the provider call.
+func (m *Model) fetchProviderPlaylists() tea.Cmd {
+	if m.provider == nil || m.headless {
+		return nil
+	}
+	gen := nextRequest(&m.requests.provider)
+	if _, ok := m.provider.(*radio.Provider); ok {
+		return m.refreshRadioLists()
+	}
+	return fetchPlaylistsCmd(m.provider, gen)
+}
+
+// refreshRadioLists projects local Radio state on the Update owner. Only
+// directory loading is asynchronous; row snapshots never cross that boundary.
+func (m *Model) refreshRadioLists() tea.Cmd {
+	m.provPane.loading = m.provSearch.loading
+	if err := m.refreshProviderListsNow(); err != nil {
+		m.err = err
+		return nil
+	}
+	return m.startCatalogLoading()
+}
+
+// refreshProviderListsNow is only used for providers whose current rows are
+// already available locally (or after an asynchronous load has completed).
+func (m *Model) refreshProviderListsNow() error {
+	lists, err := m.provider.Playlists()
+	if err != nil {
+		return err
+	}
+	m.replaceProviderLists(lists)
+	return nil
+}
+
+// refreshProviderListsAfterMutation updates local rows without starting directory
+// work or disturbing an in-flight track load. Pending list refreshes are stale.
+func (m *Model) refreshProviderListsAfterMutation() {
+	nextRequest(&m.requests.provider)
+	if err := m.refreshProviderListsNow(); err != nil {
+		m.err = err
+	}
+}
+
+func (m *Model) startCatalogLoading() tea.Cmd {
+	if cs, ok := m.provider.(provider.CatalogSearcher); ok && cs.IsSearching() {
+		return nil
+	}
+	if loader, ok := m.provider.(provider.CatalogLoader); ok && !m.catalogBatch.loading && !m.catalogBatch.done && !m.provSearch.active && !m.provSearch.loading {
+		m.catalogBatch.loading = true
+		return m.fetchCatalogBatch(loader)
+	}
+	return nil
+}
+
+// replaceProviderLists keeps the selected entry across list refreshes, where
+// inserting favorites or other rows can change its numeric position.
+func (m *Model) replaceProviderLists(lists []playlist.PlaylistInfo) {
+	selectedID := ""
+	if m.provPane.cursor >= 0 && m.provPane.cursor < len(m.provPane.lists) {
+		selectedID = m.provPane.lists[m.provPane.cursor].ID
+	}
+	m.provPane.lists = providerListsWithBrowse(m.provider, lists)
+	m.provPane.cursor = max(0, min(m.provPane.cursor, len(m.provPane.lists)-1))
+	if selectedID != "" {
+		for i, item := range m.provPane.lists {
+			if item.ID == selectedID {
+				m.provPane.cursor = i
+				break
+			}
+		}
+	}
+	m.providerMaybeAdjustScroll()
+}
+
+// refreshPaneAfterLocalWrite re-pulls Playlists() into the provider pane after
+// a local playlist mutation, but only when Local is the active provider: a
+// remote provider's pane must not receive an unrelated fetch (or surface an
+// unrelated fetch error) because of a local write.
+func (m *Model) refreshPaneAfterLocalWrite() tea.Cmd {
+	if m.activeProviderKey() != providerKeyLocal {
+		return nil
+	}
+	return m.fetchProviderPlaylists()
+}
+
+// retireTracksPaging drops any in-flight paged load. A wholesale playlist
+// replacement makes its later pages stale: they would otherwise still pass
+// the generation guard and append onto the list loaded here.
+func (m *Model) retireTracksPaging() {
+	if !m.tracksPaging {
+		return
+	}
+	nextRequest(&m.requests.tracks)
+	m.tracksPaging = false
+}
+
+func (m *Model) fetchProviderTracks(playlistID string) tea.Cmd {
+	if m.provider == nil {
+		return nil
+	}
+	gen := nextRequest(&m.requests.tracks)
+	pager, paged := m.provider.(provider.TrackPager)
+	m.tracksPaging = paged
+	if paged {
+		return fetchTracksPageCmd(pager, m.provider.Name(), playlistID, 0, gen)
+	}
+	return fetchTracksCmd(m.provider, playlistID, gen)
+}
+
+// refreshesInPlace reports whether the active provider keeps the ID of the
+// open provider playlist valid across Refresh, such as the Yandex "Моя волна"
+// session. Positional IDs, such as radio catalog indexes, do not stay valid.
+func (m *Model) refreshesInPlace() bool {
+	id := m.activeProviderPlaylistID
+	pr, ok := m.provider.(playlist.RefreshablePlaylist)
+	return ok && id != "" && pr.CanRefreshPlaylist(id)
+}
+
+// refreshActiveProvider drops the cached data of the active provider and
+// reloads it. It reopens the open provider playlist when refreshesInPlace
+// allows it. Otherwise it reloads the playlist list, or with tracksOnly it
+// reloads nothing. It does nothing while the provider loads.
+func (m *Model) refreshActiveProvider(tracksOnly bool) tea.Cmd {
+	if m.provider == nil || m.provPane.loading {
+		return nil
+	}
+	inPlace := m.refreshesInPlace()
+	if tracksOnly && !inPlace {
+		return nil
+	}
+	if r, ok := m.provider.(playlist.Refresher); ok {
+		r.Refresh()
+	}
+	nextRequest(&m.requests.catalog)
+	m.catalogBatch = catalogBatchState{}
+	m.provPane.loading = true
+	m.status.Activityf(statusTTLShort, "Refreshing %s…", m.provider.Name())
+	if inPlace {
+		return m.fetchProviderTracks(m.activeProviderPlaylistID)
+	}
+	m.activeProviderPlaylistID = ""
+	return m.fetchProviderPlaylists()
+}
+
+// applyTracksResume positions the cursor on the in-progress track and arms the
+// seek when the provider reported a stored listening position.
+func (m *Model) applyTracksResume(msg tracksLoadedMsg) {
+	if msg.resumeOffset <= 0 || msg.resumeIdx < 0 || msg.resumeIdx >= len(msg.tracks) {
+		if m.resume.path != "" && !tracksContainPath(msg.tracks, m.resume.path) {
+			m.resume.path = ""
+			m.resume.secs = 0
+		}
+		return
+	}
+	m.plCursor = msg.resumeIdx
+	m.resume.path = msg.tracks[msg.resumeIdx].Path
+	m.resume.secs = int(msg.resumeOffset.Seconds())
+}
+
+// tracksContainPath reports whether any track in tracks has the given path.
+func tracksContainPath(tracks []playlist.Track, path string) bool {
+	for _, t := range tracks {
+		if t.Path == path {
+			return true
+		}
+	}
+	return false
+}
+
+// replacePlayerPlaylist installs a provider result in the main playlist while
+// preserving detached playback semantics used by provider-list selection.
+func (m *Model) replacePlayerPlaylist(tracks []playlist.Track) {
+	if m.player.IsPlaying() || m.buffering {
+		m.detachPlaybackTrack()
+		m.player.ClearPreload()
+		m.preloading = false
+	} else {
+		m.player.Stop()
+		m.player.ClearPreload()
+		m.clearPlaybackTrack()
+	}
+	m.replacePlaylist(tracks)
+	m.setHeaderStateFromTracks(tracks)
+	m.clearLoadedPlaylist()
+	m.plCursor = 0
+	m.plScroll = 0
+	m.focus = focusPlaylist
+	m.applyHeightMode()
+	m.adjustScroll()
+}
+
+func (m Model) isActiveProvider(name string) bool {
+	return m.provider != nil && m.provider.Name() == name
+}
+
+// Provider keys of the sources that have their own UI rules. buildProviders
+// in the main package registers the providers under these keys.
+const (
+	providerKeyLocal = "local"
+	providerKeyRadio = "radio"
+)
+
+// activeProviderKey returns the config key of the active provider pill, such
+// as providerKeyLocal. A display name can change, so the special rules for a
+// source check this key. It returns "" when no provider is active.
+func (m Model) activeProviderKey() string {
+	if m.provider == nil || m.provPillIdx < 0 || m.provPillIdx >= len(m.providers) {
+		return ""
+	}
+	return m.providers[m.provPillIdx].Key
+}
+
+func (m Model) isCurrentNavRequest(gen uint64) bool {
+	return m.navBrowser.visible && gen == m.requests.nav
+}
+
+func (m Model) isCurrentSearchOverlayProvider(providerName string) bool {
+	return m.searchOverlay.visible &&
+		m.searchOverlay.prov != nil &&
+		m.searchOverlay.prov.Name() == providerName
+}
+
+func (m Model) isCurrentSearchOverlayRequest(gen uint64, providerName string) bool {
+	return m.isCurrentSearchOverlayProvider(providerName) && gen == m.requests.searchOverlay
+}
+
+func (m Model) isCurrentSearchOverlayListRequest(gen uint64, providerName string) bool {
+	return m.searchOverlay.screen == searchOverlayResults &&
+		m.isCurrentSearchOverlayProvider(providerName) &&
+		gen == m.requests.searchOverlayLists
+}
+
+func (m Model) isCurrentSearchOverlayMutation(gen uint64, providerName string) bool {
+	return m.isCurrentSearchOverlayProvider(providerName) && gen == m.requests.searchOverlayMutation
+}
+
+func (m *Model) fetchCatalogBatch(loader provider.CatalogLoader) tea.Cmd {
+	if m.provider == nil {
+		return nil
+	}
+	return fetchCatalogBatchCmd(loader, m.catalogBatch.offset, catalogBatchSize, m.provider.Name(), nextRequest(&m.requests.catalog))
 }
 
 // quickSwitchProvider closes any browser overlays and jumps to the provider
-// matched by key. Use the same Shift+letter shortcuts that switch providers
-// from the main pane (S, N, P, J, E, Y, M, R, L). Returns nil when the key doesn't
-// match a known provider.
-func (m *Model) quickSwitchProvider(key string) tea.Cmd {
+// matched by key. It takes every key of providerKeyForShortcut, N included.
+// ok is false when key is no shortcut. A shortcut of a provider that is not
+// configured still closes the overlays, and cmd is nil then.
+func (m *Model) quickSwitchProvider(key string) (cmd tea.Cmd, ok bool) {
 	provKey := providerKeyForShortcut(key)
 	if provKey == "" {
-		return nil
+		return nil, false
 	}
 	// Close any open overlays so the user lands on the provider pane.
+	m.cancelNavRequests()
 	m.navBrowser.visible = false
 	m.plManager.visible = false
 	m.fileBrowser.visible = false
-	return m.switchToProvider(provKey)
+	return m.switchToProvider(provKey), true
+}
+
+// providerShortcut switches to the provider that a Shift+letter shortcut
+// names. The playlist and the provider pane use N to browse, so N is no
+// shortcut there. ok is false when key is no shortcut.
+func (m *Model) providerShortcut(key string) (cmd tea.Cmd, ok bool) {
+	if key == "N" {
+		return nil, false
+	}
+	provKey := providerKeyForShortcut(key)
+	if provKey == "" {
+		return nil, false
+	}
+	return m.switchToProvider(provKey), true
 }
 
 // providerKeyForShortcut maps the Shift+letter provider shortcuts to the
@@ -76,14 +351,26 @@ func providerKeyForShortcut(key string) string {
 		return "jellyfin"
 	case "E":
 		return "emby"
+	case "B":
+		return "audiobookshelf"
 	case "Y":
 		return "yt"
+	case "C":
+		return "soundcloud"
+	case "X":
+		return "mixcloud"
 	case "M":
 		return "netease"
+	case "Q":
+		return "qobuz"
+	case "T":
+		return "tidal"
 	case "L":
 		return "local"
 	case "R":
 		return "radio"
+	case "O":
+		return "podcast"
 	}
 	return ""
 }
@@ -99,26 +386,286 @@ func (m *Model) switchToProvider(key string) tea.Cmd {
 	return nil
 }
 
+type browseEntryGroup struct {
+	afterID      string
+	afterSection string
+	section      string
+	lists        []playlist.PlaylistInfo
+}
+
+// providerListsWithBrowse adds UI-only hierarchical browse routes to a
+// provider's playable playlist list. Keeping these routes out of Playlists()
+// means IPC and other playlist consumers never mistake them for audio lists.
+func providerListsWithBrowse(prov playlist.Provider, lists []playlist.PlaylistInfo) []playlist.PlaylistInfo {
+	if cs, ok := prov.(provider.CatalogSearcher); ok && cs.IsSearching() {
+		return lists
+	}
+	entries, ok := prov.(provider.BrowseEntryProvider)
+	if !ok {
+		return lists
+	}
+	groups := groupBrowseEntries(entries.BrowseEntries(), lists)
+	if len(groups) == 0 {
+		return lists
+	}
+	return spliceBrowseGroups(lists, groups)
+}
+
+// groupBrowseEntries removes invalid and duplicate shortcuts, then combines
+// adjacent entries that share placement and section metadata.
+func groupBrowseEntries(entries []provider.BrowseEntry, lists []playlist.PlaylistInfo) []browseEntryGroup {
+	existing := make(map[string]struct{}, len(lists))
+	for _, item := range lists {
+		existing[item.ID] = struct{}{}
+	}
+	groups := make([]browseEntryGroup, 0, len(entries))
+	for _, entry := range entries {
+		if entry.ID == "" || entry.Name == "" {
+			continue
+		}
+		if _, duplicate := existing[entry.ID]; duplicate {
+			continue
+		}
+		existing[entry.ID] = struct{}{}
+		item := playlist.PlaylistInfo{ID: entry.ID, Name: entry.Name, Section: entry.Section}
+		last := len(groups) - 1
+		if last >= 0 &&
+			groups[last].afterID == entry.AfterID &&
+			groups[last].afterSection == entry.AfterSection &&
+			groups[last].section == entry.Section {
+			groups[last].lists = append(groups[last].lists, item)
+		} else {
+			groups = append(groups, browseEntryGroup{
+				afterID:      entry.AfterID,
+				afterSection: entry.AfterSection,
+				section:      entry.Section,
+				lists:        []playlist.PlaylistInfo{item},
+			})
+		}
+	}
+	return groups
+}
+
+// spliceBrowseGroups resolves exact-item and section fallback anchors, omits
+// extensions of missing sections, and prepends otherwise unanchored groups.
+func spliceBrowseGroups(lists []playlist.PlaylistInfo, groups []browseEntryGroup) []playlist.PlaylistInfo {
+	itemIndex := make(map[string]int, len(lists))
+	lastSectionIndex := make(map[string]int, len(lists))
+	for i, item := range lists {
+		itemIndex[item.ID] = i
+		lastSectionIndex[item.Section] = i
+	}
+	entryCount := 0
+	for _, group := range groups {
+		entryCount += len(group.lists)
+	}
+	prepend := make([]playlist.PlaylistInfo, 0, entryCount)
+	groupsAfter := make(map[int][]browseEntryGroup, len(groups))
+	for _, group := range groups {
+		anchor := -1
+		if group.afterID != "" {
+			if index, found := itemIndex[group.afterID]; found {
+				anchor = index
+			}
+		}
+		if anchor < 0 && group.afterSection != "" {
+			if index, found := lastSectionIndex[group.afterSection]; found {
+				anchor = index
+			}
+		}
+		if anchor >= 0 {
+			groupsAfter[anchor] = append(groupsAfter[anchor], group)
+			continue
+		}
+		if group.afterSection != "" && group.section == group.afterSection {
+			continue
+		}
+		prepend = append(prepend, group.lists...)
+	}
+	out := make([]playlist.PlaylistInfo, 0, len(lists)+entryCount)
+	out = append(out, prepend...)
+	for i, item := range lists {
+		out = append(out, item)
+		for _, group := range groupsAfter[i] {
+			out = append(out, group.lists...)
+		}
+	}
+	return out
+}
+
+func providerBrowseEntryForID(prov playlist.Provider, id string) (provider.BrowseEntry, bool) {
+	entries, ok := prov.(provider.BrowseEntryProvider)
+	if !ok {
+		return provider.BrowseEntry{}, false
+	}
+	for _, entry := range entries.BrowseEntries() {
+		if entry.ID == id {
+			return entry, true
+		}
+	}
+	return provider.BrowseEntry{}, false
+}
+
+func providerBrowseEntryForMode(prov playlist.Provider, mode provider.BrowseMode) (provider.BrowseEntry, bool) {
+	entries, ok := prov.(provider.BrowseEntryProvider)
+	if !ok {
+		return provider.BrowseEntry{}, false
+	}
+	for _, entry := range entries.BrowseEntries() {
+		if entry.Mode == mode {
+			return entry, true
+		}
+	}
+	return provider.BrowseEntry{}, false
+}
+
+func (m Model) selectedProviderListIsBrowseEntry() bool {
+	if m.provPane.cursor < 0 || m.provPane.cursor >= len(m.provPane.lists) {
+		return false
+	}
+	_, ok := providerBrowseEntryForID(m.provider, m.provPane.lists[m.provPane.cursor].ID)
+	return ok
+}
+
+// openProviderList activates either a playable provider list or a UI-only
+// hierarchical browse entry contributed by the provider.
+func (m *Model) openProviderList(index int) tea.Cmd {
+	if index < 0 || index >= len(m.provPane.lists) || m.provider == nil {
+		return nil
+	}
+	item := m.provPane.lists[index]
+	// The location offer is a question, not a list. Selecting it raises the
+	// question; nothing about the listener's location is worked out until they
+	// answer it.
+	if consenter, ok := m.provider.(provider.LocationConsenter); ok {
+		if id := consenter.LocationConsentID(); id != "" && id == item.ID {
+			m.provPane.askLoc = true
+			return nil
+		}
+	}
+	if entry, ok := providerBrowseEntryForID(m.provider, item.ID); ok {
+		m.activeProviderPlaylistID = ""
+		cmd := m.openNavBrowserEntry(m.provider, entry)
+		if m.navBrowser.visible {
+			m.navBrowser.fromProvList = true
+		}
+		return cmd
+	}
+	m.provPane.loading = true
+	m.activeProviderPlaylistID = item.ID
+	return m.fetchProviderTracks(item.ID)
+}
+
 // SetPendingURLs stores remote URLs (feeds, M3U) for async resolution after Init.
 func (m *Model) SetPendingURLs(urls []string) {
 	m.pendingURLs = urls
 	m.feedLoading = len(urls) > 0
 }
 
-// findBrowseProvider returns the first provider that supports browsing
-// (ArtistBrowser or AlbumBrowser), preferring the active provider.
-func (m *Model) findBrowseProvider() playlist.Provider {
-	return m.findProviderWith(func(p playlist.Provider) bool {
-		if _, ok := p.(provider.ArtistBrowser); ok {
-			return true
-		}
-		_, ok := p.(provider.AlbumBrowser)
-		return ok
-	})
+// SetLoadedPlaylist records that the live queue exactly mirrors a local saved
+// playlist, allowing path-based write-backs such as bookmarks and removals.
+func (m *Model) SetLoadedPlaylist(name string) {
+	m.loadedPlaylist = name
+	m.playlistSource = ""
 }
 
+// renameLoadedPlaylist follows a rename of the local playlist oldName to
+// newName, so queue edits and their undo write to the renamed file.
+func (m *Model) renameLoadedPlaylist(oldName, newName string) {
+	if m.loadedPlaylist != oldName {
+		return
+	}
+	m.loadedPlaylist = newName
+	if m.playlistUndo.loaded == oldName {
+		m.playlistUndo.loaded = newName
+	}
+}
+
+// clearLoadedPlaylist records that the queue mirrors no list. The undo of
+// the last queue edit goes, because it can write to the list.
+func (m *Model) clearLoadedPlaylist() {
+	m.loadedPlaylist = ""
+	m.playlistSource = ""
+	m.playlistUndo = playlistUndo{}
+}
+
+// setLoadedLocalPlaylist records the list that a provider load put in the
+// queue. Only a saved list of the local provider counts, so the name is never
+// a remote ID. History is excluded as well. The key path, the playlist
+// manager and the IPC provider.load path all use it.
+func (m *Model) setLoadedLocalPlaylist(providerName, id string) {
+	m.clearLoadedPlaylist()
+	if m.localProvider != nil && providerName == m.localProvider.Name() && id != history.PlaylistName {
+		m.loadedPlaylist = id
+	}
+}
+
+// writableLoadedPlaylist returns the local playlist file that queue edits and
+// duration backfills write to, or "" when there is none. loadedPlaylist can
+// also name Favorites, which the ♥ rule reads as a saved list. Favorites and
+// History are virtual lists with their own stores, so they are never written.
+func (m Model) writableLoadedPlaylist() string {
+	switch m.loadedPlaylist {
+	case favorites.PlaylistName, history.PlaylistName:
+		return ""
+	}
+	return m.loadedPlaylist
+}
+
+// findBrowseProvider returns the first provider that supports artist, album,
+// or genre browsing, preferring the active provider.
+func (m *Model) findBrowseProvider() playlist.Provider {
+	return m.findProviderWith(providerSupportsBrowse)
+}
+
+func (m *Model) openDefaultProviderBrowser() tea.Cmd {
+	preferred, ok := m.provider.(provider.DefaultBrowseModeProvider)
+	if !ok {
+		return nil
+	}
+	return m.openNavBrowserAt(m.provider, preferred.DefaultBrowseMode())
+}
+
+func providerSupportsBrowse(prov playlist.Provider) bool {
+	if prov == nil {
+		return false
+	}
+	if _, ok := prov.(provider.ArtistBrowser); ok {
+		return true
+	}
+	if _, ok := prov.(provider.AlbumBrowser); ok {
+		return true
+	}
+	_, ok := prov.(provider.GenreBrowser)
+	return ok
+}
+
+// navGenreBrowser returns the route-specific category catalogue when one was
+// selected, otherwise the provider's default catalogue. The fallback also
+// keeps directly constructed navigation state useful in tests and integrations.
+func (m Model) navGenreBrowser() provider.GenreBrowser {
+	if m.navBrowser.genreBrowser != nil {
+		return m.navBrowser.genreBrowser
+	}
+	browser, _ := m.navBrowser.prov.(provider.GenreBrowser)
+	return browser
+}
+
+// canOpenProviderBrowser keeps help scoped to the active provider or a
+// highlighted track with a provider-specific creator jump. Merely registering
+// another browsable provider must not advertise its browser in this context.
+func (m Model) canOpenProviderBrowser() bool {
+	if _, ok := m.selectedTrackArtistBrowserTarget(); ok {
+		return true
+	}
+	return providerSupportsBrowse(m.provider)
+}
+
+// openNavBrowserWith resets and opens the hierarchy for prov at its root menu.
 func (m *Model) openNavBrowserWith(prov playlist.Provider) {
+	nextRequest(&m.requests.nav)
 	m.navBrowser.prov = prov
+	m.navBrowser.genreBrowser, _ = prov.(provider.GenreBrowser)
 	m.navBrowser.visible = true
 	m.navBrowser.mode = navBrowseModeMenu
 	m.navBrowser.screen = navBrowseScreenList
@@ -127,19 +674,179 @@ func (m *Model) openNavBrowserWith(prov playlist.Provider) {
 	m.navBrowser.artists = nil
 	m.navBrowser.albums = nil
 	m.navBrowser.tracks = nil
+	m.navBrowser.genres = nil
+	m.navBrowser.genreSorts = nil
 	m.navBrowser.loading = false
 	m.navBrowser.albumLoading = false
 	m.navBrowser.albumDone = false
 	m.navBrowser.searching = false
 	m.navBrowser.search = ""
 	m.navBrowser.searchIdx = nil
+	m.navBrowser.confirmReplace = false
+	m.navBrowser.directTrackJump = false
+	m.navBrowser.fromProvList = false
+	m.navBrowser.openInPlaylist = false
 	m.navBrowser.selArtist = provider.ArtistInfo{}
 	m.navBrowser.selAlbum = provider.AlbumInfo{}
+	m.navBrowser.selGenre = provider.GenreInfo{}
+	m.navBrowser.selGenreSort = provider.SortType{}
+	m.navBrowser.genreQuery = ""
 	if ab, ok := prov.(provider.AlbumBrowser); ok {
 		m.navBrowser.sortType = ab.DefaultAlbumSort()
 	} else {
 		m.navBrowser.sortType = ""
 	}
+}
+
+func (m *Model) navBackFromRoot() {
+	m.cancelNavRequests()
+	m.navClearSearch()
+	if m.navBrowser.fromProvList {
+		m.navBrowser.fromProvList = false
+		m.navBrowser.visible = false
+		return
+	}
+	m.navBrowser.mode = navBrowseModeMenu
+	m.navBrowser.screen = navBrowseScreenList
+	m.navBrowser.cursor = 0
+	m.navBrowser.scroll = 0
+}
+
+// openNavBrowserAt opens a provider's hierarchy at a concrete route instead
+// of making the user pass through the generic browse-mode menu first.
+func (m *Model) openNavBrowserAt(prov playlist.Provider, mode provider.BrowseMode) tea.Cmd {
+	openInPlaylist := false
+	entryID := ""
+	if entry, ok := providerBrowseEntryForMode(prov, mode); ok {
+		openInPlaylist = entry.OpenInPlaylist
+		entryID = entry.ID
+	}
+	return m.openNavBrowserRoute(prov, mode, entryID, openInPlaylist)
+}
+
+// openNavBrowserEntry opens the exact provider-pane route selected by ID. It
+// must not re-resolve by mode because providers may expose multiple entries
+// with the same hierarchy and different leaf behavior.
+func (m *Model) openNavBrowserEntry(prov playlist.Provider, entry provider.BrowseEntry) tea.Cmd {
+	return m.openNavBrowserRoute(prov, entry.Mode, entry.ID, entry.OpenInPlaylist)
+}
+
+// openNavBrowserRoute resolves and loads one concrete provider browse route.
+func (m *Model) openNavBrowserRoute(prov playlist.Provider, mode provider.BrowseMode, entryID string, openInPlaylist bool) tea.Cmd {
+	if restricted, ok := prov.(provider.BrowseModeProvider); ok && !slices.Contains(restricted.BrowseModes(), mode) {
+		return nil
+	}
+	m.openNavBrowserWith(prov)
+	m.navBrowser.openInPlaylist = openInPlaylist
+	switch mode {
+	case provider.BrowseAlbums:
+		browser, ok := prov.(provider.AlbumBrowser)
+		if !ok {
+			m.navBrowser.visible = false
+			return nil
+		}
+		m.navBrowser.mode = navBrowseModeByAlbum
+		m.navBrowser.albumLoading = true
+		return fetchNavAlbumListCmd(browser, m.navBrowser.sortType, 0, m.nextNavRequest())
+	case provider.BrowseArtists, provider.BrowseArtistAlbums:
+		browser, ok := prov.(provider.ArtistBrowser)
+		if !ok {
+			m.navBrowser.visible = false
+			return nil
+		}
+		if mode == provider.BrowseArtistAlbums {
+			m.navBrowser.mode = navBrowseModeByArtistAlbum
+		} else {
+			m.navBrowser.mode = navBrowseModeByArtist
+		}
+		m.navBrowser.loading = true
+		return fetchNavArtistsCmd(browser, m.nextNavRequest())
+	case provider.BrowseGenres:
+		browser := m.navBrowser.genreBrowser
+		if router, ok := prov.(provider.GenreBrowseRouter); ok && entryID != "" {
+			browser = router.GenreBrowserFor(entryID)
+		}
+		if browser == nil {
+			m.navBrowser.visible = false
+			return nil
+		}
+		m.navBrowser.genreBrowser = browser
+		m.navBrowser.mode = navBrowseModeByGenre
+		m.navBrowser.loading = true
+		return fetchNavGenresCmd(browser, m.nextNavRequest())
+	default:
+		m.navBrowser.visible = false
+		return nil
+	}
+}
+
+type selectedTrackArtistTarget struct {
+	prov    playlist.Provider
+	browser provider.ArtistBrowser
+	artist  provider.ArtistInfo
+}
+
+func (m Model) selectedTrackArtistBrowserTarget() (selectedTrackArtistTarget, bool) {
+	if m.focus != focusPlaylist || m.playlist == nil {
+		return selectedTrackArtistTarget{}, false
+	}
+	track, ok := m.playlist.Track(m.plCursor)
+	if !ok {
+		return selectedTrackArtistTarget{}, false
+	}
+	candidates := make([]playlist.Provider, 0, len(m.providers)+1)
+	if m.provider != nil {
+		candidates = append(candidates, m.provider)
+	}
+	for _, entry := range m.providers {
+		if entry.Provider != nil {
+			candidates = append(candidates, entry.Provider)
+		}
+	}
+	for _, candidate := range candidates {
+		resolver, ok := candidate.(provider.TrackArtistResolver)
+		if !ok {
+			continue
+		}
+		artist, ok := resolver.ArtistForTrack(track)
+		if !ok {
+			continue
+		}
+		browser, ok := candidate.(provider.ArtistBrowser)
+		if ok {
+			return selectedTrackArtistTarget{prov: candidate, browser: browser, artist: artist}, true
+		}
+	}
+	return selectedTrackArtistTarget{}, false
+}
+
+// openSelectedTrackArtistBrowser jumps from the highlighted track to its
+// artist's album/show categories when one registered provider recognizes it.
+func (m *Model) openSelectedTrackArtistBrowser() (tea.Cmd, bool) {
+	target, ok := m.selectedTrackArtistBrowserTarget()
+	if !ok {
+		return nil, false
+	}
+	m.openNavBrowserWith(target.prov)
+	m.navBrowser.mode = navBrowseModeByArtistAlbum
+	m.navBrowser.screen = navBrowseScreenAlbums
+	m.navBrowser.selArtist = target.artist
+	m.navBrowser.directTrackJump = true
+	if entry, found := providerBrowseEntryForMode(target.prov, provider.BrowseArtistAlbums); found {
+		m.navBrowser.openInPlaylist = entry.OpenInPlaylist
+	}
+	m.navBrowser.loading = true
+	return fetchNavArtistAlbumsCmd(target.browser, target.artist.ID, m.nextNavRequest()), true
+}
+
+func (m *Model) nextNavRequest() uint64 {
+	return nextRequest(&m.requests.nav)
+}
+
+func (m *Model) cancelNavRequests() {
+	nextRequest(&m.requests.nav)
+	m.navBrowser.loading = false
+	m.navBrowser.albumLoading = false
 }
 
 // navUpdateSearch rebuilds navSearchIdx from the current navSearch query
@@ -167,6 +874,19 @@ func (m *Model) navUpdateSearch() {
 				m.navBrowser.searchIdx = append(m.navBrowser.searchIdx, i)
 			}
 		}
+	case m.navBrowser.mode == navBrowseModeByGenre && m.navBrowser.screen == navBrowseScreenList:
+		for i, genre := range m.navBrowser.genres {
+			if strings.Contains(strings.ToLower(genre.Name), q) ||
+				strings.Contains(strings.ToLower(genre.Group), q) {
+				m.navBrowser.searchIdx = append(m.navBrowser.searchIdx, i)
+			}
+		}
+	case m.navBrowser.mode == navBrowseModeByGenre && m.navBrowser.screen == navBrowseScreenAlbums:
+		for i, sortType := range m.navBrowser.genreSorts {
+			if strings.Contains(strings.ToLower(sortType.Label), q) {
+				m.navBrowser.searchIdx = append(m.navBrowser.searchIdx, i)
+			}
+		}
 	case m.navBrowser.screen == navBrowseScreenTracks:
 		for i, t := range m.navBrowser.tracks {
 			if strings.Contains(strings.ToLower(t.Title), q) ||
@@ -187,27 +907,36 @@ func (m *Model) navClearSearch() {
 	m.navBrowser.scroll = 0
 }
 
+// navClearSearchKeepingCursor removes a filter while keeping the selected raw
+// item highlighted during an in-flight leaf request.
+func (m *Model) navClearSearchKeepingCursor(cursor int) {
+	m.navClearSearch()
+	m.navBrowser.cursor = cursor
+	m.navMaybeAdjustScroll()
+}
+
 // fetchNavArtistAllTracksCmd first fetches the artist's album list, then fetches
 // all tracks across every album. This is used by the "By Artist" browse mode.
 // The provider must implement both ArtistBrowser and AlbumTrackLoader.
 func (m *Model) fetchNavArtistAllTracksCmd(ab provider.ArtistBrowser, artistID string) tea.Cmd {
+	gen := m.nextNavRequest()
 	loader, _ := m.navBrowser.prov.(provider.AlbumTrackLoader)
 	return func() tea.Msg {
 		albums, err := ab.ArtistAlbums(artistID)
 		if err != nil {
-			return err
+			return navTracksLoadedMsg{gen: gen, err: err}
 		}
 		if loader == nil {
-			return navTracksLoadedMsg(nil)
+			return navTracksLoadedMsg{gen: gen}
 		}
 		var all []playlist.Track
 		for _, album := range albums {
 			tracks, err := loader.AlbumTracks(album.ID)
 			if err != nil {
-				return err
+				return navTracksLoadedMsg{gen: gen, err: err}
 			}
 			all = append(all, tracks...)
 		}
-		return navTracksLoadedMsg(all)
+		return navTracksLoadedMsg{tracks: all, gen: gen}
 	}
 }

@@ -17,9 +17,11 @@ import (
 	"sync"
 	"time"
 
-	"cliamp/config"
-	"cliamp/playlist"
-	"cliamp/provider"
+	"github.com/bjarneo/cliamp/config"
+	"github.com/bjarneo/cliamp/internal/httpclient"
+	"github.com/bjarneo/cliamp/internal/netdiag"
+	"github.com/bjarneo/cliamp/playlist"
+	"github.com/bjarneo/cliamp/provider"
 )
 
 // Compile-time interface checks.
@@ -33,10 +35,12 @@ var (
 )
 
 // httpClient is used for all Navidrome API calls with a finite timeout.
-var httpClient = &http.Client{Timeout: 30 * time.Second}
+var httpClient = httpclient.NewAPI(30 * time.Second)
 
-// maxResponseBody limits JSON API responses to 10 MB to prevent unbounded memory growth.
-const maxResponseBody = 10 << 20
+// maxResponseBody limits JSON API responses to 128 MB to prevent unbounded
+// memory growth. A getPlaylist response runs roughly 1.2 KB per entry, so this
+// leaves room for playlists of ~100k tracks.
+const maxResponseBody = 128 << 20
 
 // Sort type constants for album browsing (Subsonic getAlbumList2 "type" parameter).
 const (
@@ -88,10 +92,15 @@ type NavidromeClient struct {
 	user             string
 	password         string
 	browseSort       string
+	format           string
 	scrobbleDisabled bool
-	mu               sync.Mutex
-	playlistCache    []playlist.PlaylistInfo
-	trackCache       map[string][]playlist.Track
+	// SaveSort saves the album sort that the user picks. The caller sets
+	// it, as main sets it to config.SaveNavidromeSort. When it is nil,
+	// SaveAlbumSort keeps the sort for this session only.
+	SaveSort      func(sortType string) error
+	mu            sync.Mutex
+	playlistCache []playlist.PlaylistInfo
+	trackCache    map[string][]playlist.Track
 }
 
 // New creates a NavidromeClient with the given server credentials.
@@ -105,15 +114,13 @@ func New(serverURL, user, password string) *NavidromeClient {
 }
 
 // NewFromEnv creates a NavidromeClient from NAVIDROME_URL, NAVIDROME_USER,
-// and NAVIDROME_PASS environment variables. Returns nil if any are unset.
-func NewFromEnv() *NavidromeClient {
-	u := os.Getenv("NAVIDROME_URL")
-	user := os.Getenv("NAVIDROME_USER")
-	pass := os.Getenv("NAVIDROME_PASS")
-	if u == "" || user == "" || pass == "" {
-		return nil
-	}
-	return New(u, user, pass)
+// and NAVIDROME_PASS environment variables, retaining non-credential settings
+// from cfg. Returns nil if any environment credentials are unset.
+func NewFromEnv(cfg config.NavidromeConfig) *NavidromeClient {
+	cfg.URL = os.Getenv("NAVIDROME_URL")
+	cfg.User = os.Getenv("NAVIDROME_USER")
+	cfg.Password = os.Getenv("NAVIDROME_PASS")
+	return NewFromConfig(cfg)
 }
 
 // NewFromConfig creates a NavidromeClient from a config.NavidromeConfig value.
@@ -125,6 +132,9 @@ func NewFromConfig(cfg config.NavidromeConfig) *NavidromeClient {
 	client := New(cfg.URL, cfg.User, cfg.Password)
 	if cfg.BrowseSort != "" {
 		client.browseSort = cfg.BrowseSort
+	}
+	if cfg.Format != "" {
+		client.format = cfg.Format
 	}
 	client.scrobbleDisabled = cfg.ScrobbleDisabled
 	return client
@@ -152,12 +162,17 @@ func (c *NavidromeClient) DefaultAlbumSort() string {
 	return SortAlphabeticalByName
 }
 
+// SaveAlbumSort makes sortType the album sort and saves it through SaveSort.
+// An empty sortType selects SortAlphabeticalByName.
 func (c *NavidromeClient) SaveAlbumSort(sortType string) error {
 	if sortType == "" {
 		sortType = SortAlphabeticalByName
 	}
 	c.browseSort = sortType
-	return config.SaveNavidromeSort(sortType)
+	if c.SaveSort == nil {
+		return nil
+	}
+	return c.SaveSort(sortType)
 }
 
 // subsonicError represents an application-level error from the Subsonic API.
@@ -204,10 +219,36 @@ func (c *NavidromeClient) buildURL(endpoint string, params url.Values) string {
 	return fmt.Sprintf("%s/rest/%s?%s", c.url, endpoint, params.Encode())
 }
 
+// httpGet performs a GET with the same User-Agent the stream download uses, so
+// Navidrome registers a single player for cliamp instead of one per User-Agent.
+func (c *NavidromeClient) httpGet(rawURL string) (*http.Response, error) {
+	return c.httpGetContext(context.Background(), rawURL)
+}
+
+// httpGetContext is httpGet with a context that can cancel the request.
+func (c *NavidromeClient) httpGetContext(ctx context.Context, rawURL string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", httpclient.UserAgent)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, netdiag.Explain(err)
+	}
+	return resp, nil
+}
+
 // subsonicGet performs a GET to the Subsonic API endpoint, decodes the JSON
 // response into result, and checks for both HTTP and API-level errors.
 func (c *NavidromeClient) subsonicGet(endpoint string, params url.Values, result any) error {
-	resp, err := httpClient.Get(c.buildURL(endpoint, params))
+	return c.subsonicGetContext(context.Background(), endpoint, params, result)
+}
+
+// subsonicGetContext is subsonicGet with a context that can cancel the
+// request.
+func (c *NavidromeClient) subsonicGetContext(ctx context.Context, endpoint string, params url.Values, result any) error {
+	resp, err := c.httpGetContext(ctx, c.buildURL(endpoint, params))
 	if err != nil {
 		return fmt.Errorf("navidrome: %s: %w", endpoint, err)
 	}
@@ -215,7 +256,9 @@ func (c *NavidromeClient) subsonicGet(endpoint string, params url.Values, result
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("navidrome: %s: http status %s", endpoint, resp.Status)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
+	// The body is decoded twice, once for the error envelope and once into
+	// result, so read the bytes here rather than through ReadJSON.
+	body, err := httpclient.ReadBody(resp.Body, maxResponseBody)
 	if err != nil {
 		return fmt.Errorf("navidrome: %s: %w", endpoint, err)
 	}
@@ -503,32 +546,37 @@ func albumFromSubsonic(a subsonicAlbum) Album {
 }
 
 // streamURL generates the authenticated streaming URL for a track ID.
-// format=raw (Subsonic API 1.9.0+) instructs the server to return the original
-// file without transcoding, giving a genuine Content-Length and preserving
-// audio quality (FLAC, OPUS, AAC, MP3 — whatever is stored).
+// Without a format parameter, Navidrome applies the player's transcoding if
+// configured, otherwise it sends the original file. Transcoded streams may be
+// chunked without a Content-Length until cached. format=raw (Subsonic 1.9.0+)
+// always requests the original file.
 func (c *NavidromeClient) streamURL(id string) string {
-	return c.buildURL("stream", url.Values{"id": {id}, "format": {"raw"}})
+	urlValues := url.Values{"id": {id}}
+	if format := strings.ToLower(strings.TrimSpace(c.format)); format != "" {
+		urlValues.Set("format", format)
+	}
+	return c.buildURL("stream", urlValues)
 }
 
 func (c *NavidromeClient) CanReportPlayback(track playlist.Track) bool {
 	return !c.scrobbleDisabled && track.Meta(provider.MetaNavidromeID) != ""
 }
 
-func (c *NavidromeClient) ReportNowPlaying(track playlist.Track, _ time.Duration, _ bool) {
-	c.scrobble(track.Meta(provider.MetaNavidromeID), false)
+func (c *NavidromeClient) ReportNowPlaying(track playlist.Track, _ time.Duration, _ bool) error {
+	return c.scrobble(track.Meta(provider.MetaNavidromeID), false)
 }
 
-func (c *NavidromeClient) ReportScrobble(track playlist.Track, _, _ time.Duration, _ bool) {
-	c.scrobble(track.Meta(provider.MetaNavidromeID), true)
+func (c *NavidromeClient) ReportScrobble(track playlist.Track, _, _ time.Duration, _ bool) error {
+	return c.scrobble(track.Meta(provider.MetaNavidromeID), true)
 }
 
 // scrobble reports playback of a track to the Subsonic server.
 // If submission is false, it registers a "now playing" notification only.
 // If submission is true, it records a full play (updates play count, last.fm, etc.).
-// The call is best-effort: errors are silently discarded.
-func (c *NavidromeClient) scrobble(id string, submission bool) {
+// The call is best-effort: the error is returned for logging, never acted on.
+func (c *NavidromeClient) scrobble(id string, submission bool) error {
 	if id == "" {
-		return
+		return nil
 	}
 	params := url.Values{
 		"id":         {id},
@@ -539,9 +587,10 @@ func (c *NavidromeClient) scrobble(id string, submission bool) {
 		// the spec for submission=true (Subsonic API 1.8.0+).
 		params.Set("time", fmt.Sprintf("%d", time.Now().UnixMilli()))
 	}
-	resp, err := httpClient.Get(c.buildURL("scrobble", params))
+	resp, err := c.httpGet(c.buildURL("scrobble", params))
 	if err != nil {
-		return // fire-and-forget; ignore network errors
+		return fmt.Errorf("navidrome: scrobble: %w", err)
 	}
 	resp.Body.Close()
+	return nil
 }

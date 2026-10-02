@@ -9,28 +9,39 @@ import (
 	"strings"
 	"time"
 
-	"cliamp/playlist"
+	"github.com/bjarneo/cliamp/config"
+	"github.com/bjarneo/cliamp/internal/httpclient"
+	"github.com/bjarneo/cliamp/internal/netdiag"
+	"github.com/bjarneo/cliamp/playlist"
 )
 
-// Config holds the values read from [finch] in config.toml
-type Config struct {
-	URL string
-}
-
-// Provider implements provider.Browser
+// Provider implements playlist.Provider for a Finch server.
 type Provider struct {
-	cfg    Config
-	client *http.Client
+	baseURL string // the server URL without a trailing slash
+	client  *http.Client
 }
 
-// New returns a ready-to-use Finch provider
-func New(cfg Config) *Provider {
-	return &Provider{
-		cfg: cfg,
-		client: &http.Client{
-			Timeout: 15 * time.Second,
-		},
+// NewFromConfig returns a Provider from a FinchConfig, or nil when the server
+// URL is missing.
+func NewFromConfig(cfg config.FinchConfig) *Provider {
+	if !cfg.IsSet() {
+		return nil
 	}
+	return &Provider{
+		baseURL: strings.TrimRight(cfg.URL, "/"),
+		client:  httpclient.NewAPI(15 * time.Second),
+	}
+}
+
+// IsStreamURL reports whether u is a Finch item stream endpoint. These are
+// finite files, so the player buffers them for seeking.
+func IsStreamURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	p := strings.ToLower(u.Path)
+	return strings.Contains(p, "/api/v1/items/") && strings.HasSuffix(p, "/stream")
 }
 
 type albumResponse struct {
@@ -84,10 +95,6 @@ func (p *Provider) Playlists() ([]playlist.PlaylistInfo, error) {
 	type playlistsResult struct {
 		playlists []playlistResponse
 		err       error
-	}
-	type djMixesResult struct {
-		djmixes []item
-		err     error
 	}
 
 	albumsCh := make(chan albumsResult, 1)
@@ -153,17 +160,7 @@ func (p *Provider) Tracks(id string) ([]playlist.Track, error) {
 			return nil, err
 		}
 		for _, i := range items {
-			result = append(result, playlist.Track{
-				Path:         p.cfg.URL + "/api/v1/items/" + strconv.Itoa(i.ID) + "/stream",
-				TrackNumber:  i.Disc*100 + i.Track,
-				Title:        i.Title,
-				Artist:       i.Artist,
-				Album:        i.Album,
-				Stream:       true, // true for HTTP/HTTPS URLs
-				Realtime:     false,
-				DurationSecs: int(i.Duration),
-				Genre:        i.Genre,
-			})
+			result = append(result, p.track(i, i.Album, i.Disc*100+i.Track))
 		}
 	case strings.HasPrefix(id, "playlist:"):
 		entries, err := p.fetchPlaylistItems(strings.TrimPrefix(id, "playlist:"))
@@ -171,17 +168,7 @@ func (p *Provider) Tracks(id string) ([]playlist.Track, error) {
 			return nil, err
 		}
 		for _, e := range entries {
-			result = append(result, playlist.Track{
-				Path:         p.cfg.URL + "/api/v1/items/" + strconv.Itoa(e.Item.ID) + "/stream",
-				TrackNumber:  e.Index,
-				Title:        e.Item.Title,
-				Artist:       e.Item.Artist,
-				Album:        e.Playlist,
-				Stream:       true, // true for HTTP/HTTPS URLs
-				Realtime:     false,
-				DurationSecs: int(e.Item.Duration),
-				Genre:        e.Item.Genre,
-			})
+			result = append(result, p.track(e.Item, e.Playlist, e.Index))
 		}
 	case strings.HasPrefix(id, "djmixes"):
 		items, err := p.fetchDjMixes()
@@ -189,16 +176,7 @@ func (p *Provider) Tracks(id string) ([]playlist.Track, error) {
 			return nil, err
 		}
 		for _, i := range items {
-			result = append(result, playlist.Track{
-				Path:         p.cfg.URL + "/api/v1/items/" + strconv.Itoa(i.ID) + "/stream",
-				Title:        i.Title,
-				Artist:       i.Artist,
-				Album:        "DJ mix",
-				Stream:       true, // true for HTTP/HTTPS URLs
-				Realtime:     false,
-				DurationSecs: int(i.Duration),
-				Genre:        i.Genre,
-			})
+			result = append(result, p.track(i, "DJ mix", 0))
 		}
 	case strings.HasPrefix(id, "tracks"):
 		items, err := p.fetchSingletonTracks()
@@ -206,16 +184,7 @@ func (p *Provider) Tracks(id string) ([]playlist.Track, error) {
 			return nil, err
 		}
 		for _, i := range items {
-			result = append(result, playlist.Track{
-				Path:         p.cfg.URL + "/api/v1/items/" + strconv.Itoa(i.ID) + "/stream",
-				Title:        i.Title,
-				Artist:       i.Artist,
-				Album:        "Tracks",
-				Stream:       true, // true for HTTP/HTTPS URLs
-				Realtime:     false,
-				DurationSecs: int(i.Duration),
-				Genre:        i.Genre,
-			})
+			result = append(result, p.track(i, "Tracks", 0))
 		}
 	default:
 		return nil, fmt.Errorf("finch: unknown id format: %s", id)
@@ -224,11 +193,25 @@ func (p *Provider) Tracks(id string) ([]playlist.Track, error) {
 	return result, nil
 }
 
+// track returns the playable track of i, listed under album at position number.
+func (p *Provider) track(i item, album string, number int) playlist.Track {
+	return playlist.Track{
+		Path:         p.baseURL + "/api/v1/items/" + strconv.Itoa(i.ID) + "/stream",
+		TrackNumber:  number,
+		Title:        i.Title,
+		Artist:       i.Artist,
+		Album:        album,
+		Stream:       true, // true for HTTP/HTTPS URLs
+		DurationSecs: int(i.Duration),
+		Genre:        i.Genre,
+	}
+}
+
 // get performs a GET request to the given API path, decodes the JSON response
 // into T, and returns it. params may be nil if no query parameters are needed.
 func get[T any](p *Provider, path string, params url.Values) (T, error) {
 	var zero T
-	u, err := url.Parse(strings.TrimRight(p.cfg.URL, "/") + path)
+	u, err := url.Parse(p.baseURL + path)
 	if err != nil {
 		return zero, fmt.Errorf("finch: parse url: %w", err)
 	}
@@ -238,7 +221,7 @@ func get[T any](p *Provider, path string, params url.Values) (T, error) {
 
 	resp, err := p.client.Get(u.String())
 	if err != nil {
-		return zero, fmt.Errorf("finch: GET %s: %w", u, err)
+		return zero, fmt.Errorf("finch: GET %s: %w", u, netdiag.Explain(err))
 	}
 	defer resp.Body.Close()
 

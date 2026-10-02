@@ -8,7 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"cliamp/provider"
+	"github.com/bjarneo/cliamp/internal/ytdlp"
+	"github.com/bjarneo/cliamp/provider"
 )
 
 func TestPlaylistsIncludesAccountListsAndCharts(t *testing.T) {
@@ -144,8 +145,8 @@ func TestExtractBrowserCookieHeaderMissingYTDLPShowsInstallHint(t *testing.T) {
 	if !strings.HasPrefix(msg, "yt-dlp not found. Install with: ") {
 		t.Fatalf("error = %q", msg)
 	}
-	if strings.TrimPrefix(msg, "yt-dlp not found. Install with: ") == "" {
-		t.Fatalf("missing install hint in error = %q", msg)
+	if got, want := strings.TrimPrefix(msg, "yt-dlp not found. Install with: "), ytdlp.InstallHint(); got != want {
+		t.Fatalf("install hint = %q, want %q", got, want)
 	}
 }
 

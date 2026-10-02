@@ -1,6 +1,6 @@
 // Package embyapi implements the shared Emby/Jellyfin HTTP client. The two
 // servers speak nearly the same API; the few differences (auth header scheme,
-// ping endpoint, user-id discovery, error prefix, metadata key) are isolated
+// ping check, user-id discovery, error prefix, metadata key) are isolated
 // in a dialect so emby and jellyfin can be thin wrappers over one client.
 package embyapi
 
@@ -18,14 +18,25 @@ import (
 	"sync"
 	"time"
 
-	"cliamp/playlist"
-	"cliamp/provider"
+	"github.com/bjarneo/cliamp/internal/httpclient"
+	"github.com/bjarneo/cliamp/internal/netdiag"
+	"github.com/bjarneo/cliamp/playlist"
+	"github.com/bjarneo/cliamp/provider"
 )
 
-var defaultHTTPClient = &http.Client{Timeout: 30 * time.Second}
+var defaultHTTPClient = httpclient.NewAPI(30 * time.Second)
 
 // maxResponseBody limits API responses to 10 MB to prevent unbounded memory growth.
 const maxResponseBody = 10 << 20
+
+const (
+	// albumPageSize is the number of albums one /Items request asks for. An
+	// album item is about 1.5 KB, so a page stays far below maxResponseBody.
+	albumPageSize = 500
+	// albumMaxPages stops the paging loop if a server never sends a short
+	// page.
+	albumMaxPages = 1000
+)
 
 // Client speaks to an Emby or Jellyfin server over its HTTP API.
 type Client struct {
@@ -35,6 +46,10 @@ type Client struct {
 	deviceID   string
 	dialect    dialect
 	httpClient *http.Client
+
+	// authMu serializes password authentication. Startup may fetch playlists and
+	// artists concurrently, and Jellyfin can reject overlapping login requests.
+	authMu sync.Mutex
 
 	// mu guards the lazily-populated fields below, which are read and written
 	// from concurrent tea.Cmd goroutines. It is never held across network I/O.
@@ -90,9 +105,6 @@ func (c *Client) ClearCache() {
 	c.albumCache = nil
 	c.mu.Unlock()
 }
-
-// MetaKey returns the playlist.Track ProviderMeta key for this server's item IDs.
-func (c *Client) MetaKey() string { return c.dialect.metaKey() }
 
 // Library represents a music library view.
 type Library struct {
@@ -188,8 +200,7 @@ type playbackStopInfo struct {
 
 // Ping checks that the server is reachable and the token is accepted.
 func (c *Client) Ping() error {
-	var raw json.RawMessage
-	return c.get(c.dialect.pingPath(), nil, &raw)
+	return c.dialect.ping(c)
 }
 
 // UserID returns the active user id, discovering it lazily when needed.
@@ -368,31 +379,52 @@ func (c *Client) DefaultAlbumSort() string {
 	return SortAlbumsByName
 }
 
-// AlbumsByLibrary returns all albums under one music library view.
+// AlbumsByLibrary returns all albums under one music library view. It reads
+// the library in pages of albumPageSize, so a large library does not need one
+// response that is larger than maxResponseBody.
 func (c *Client) AlbumsByLibrary(libraryID string) ([]Album, error) {
 	userID, err := c.UserID()
 	if err != nil {
 		return nil, err
 	}
 
-	params := url.Values{
-		"userId":                 {userID},
-		"parentId":               {libraryID},
-		"recursive":              {"true"},
-		"includeItemTypes":       {"MusicAlbum"},
-		"sortBy":                 {"SortName"},
-		"sortOrder":              {"Ascending"},
-		"enableTotalRecordCount": {"false"},
-	}
+	var out []Album
+	var prevFirstID string
+	for page := 0; page < albumMaxPages; page++ {
+		params := url.Values{
+			"userId":                 {userID},
+			"parentId":               {libraryID},
+			"recursive":              {"true"},
+			"includeItemTypes":       {"MusicAlbum"},
+			"sortBy":                 {"SortName"},
+			"sortOrder":              {"Ascending"},
+			"enableTotalRecordCount": {"false"},
+			"startIndex":             {strconv.Itoa(page * albumPageSize)},
+			"limit":                  {strconv.Itoa(albumPageSize)},
+		}
 
-	var resp itemsResponseDTO
-	if err := c.get("/Items", params, &resp); err != nil {
-		return nil, err
-	}
-
-	out := make([]Album, 0, len(resp.Items))
-	for _, it := range resp.Items {
-		out = append(out, albumFromItem(it))
+		var resp itemsResponseDTO
+		if err := c.get("/Items", params, &resp); err != nil {
+			return nil, err
+		}
+		// A page that starts with the album that started the page before
+		// it means that the server ignored startIndex. Each further page
+		// would repeat the first one.
+		if len(resp.Items) > 0 {
+			firstID := resp.Items[0].ID
+			if firstID != "" && firstID == prevFirstID {
+				return nil, fmt.Errorf("%s: /Items: server ignored startIndex %d", c.dialect.name(), page*albumPageSize)
+			}
+			prevFirstID = firstID
+		}
+		for _, it := range resp.Items {
+			out = append(out, albumFromItem(it))
+		}
+		// A short page is the last page. A page longer than the limit means
+		// that the server ignored the limit and sent the whole library.
+		if len(resp.Items) != albumPageSize {
+			break
+		}
 	}
 	return out, nil
 }
@@ -471,11 +503,69 @@ func IsStreamURL(path string) bool {
 	return strings.Contains(p, "/items/") && strings.HasSuffix(p, "/download")
 }
 
+// StreamItemID extracts an item ID from a download URL belonging to this
+// server. It rejects lookalike URLs from other Jellyfin or Emby servers.
+func (c *Client) StreamItemID(rawURL string) (string, bool) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", false
+	}
+	base, err := url.Parse(c.baseURL)
+	if err != nil || !strings.EqualFold(u.Scheme, base.Scheme) || !strings.EqualFold(u.Host, base.Host) {
+		return "", false
+	}
+
+	prefix := strings.TrimRight(base.Path, "/") + "/Items/"
+	if len(u.Path) < len(prefix) || !strings.EqualFold(u.Path[:len(prefix)], prefix) {
+		return "", false
+	}
+	rest := u.Path[len(prefix):]
+	itemID, suffix, ok := strings.Cut(rest, "/")
+	if !ok || itemID == "" || !strings.EqualFold(suffix, "Download") {
+		return "", false
+	}
+	return itemID, true
+}
+
+// ResolveSource refreshes this server's download URLs at play time. Other
+// sources pass through unchanged without authentication.
+func (c *Client) ResolveSource(rawURL string) (string, error) {
+	itemID, ok := c.StreamItemID(rawURL)
+	if !ok {
+		return rawURL, nil
+	}
+	if err := c.ensureAuth(); err != nil {
+		return "", err
+	}
+	return c.streamURL(itemID, c.authToken()), nil
+}
+
+// StreamURLFromCurrentAuth returns an authenticated stream URL without doing
+// network I/O. It reports false when password authentication has not run yet.
+func (c *Client) StreamURLFromCurrentAuth(itemID string) (string, bool) {
+	token := c.authToken()
+	if token == "" {
+		return "", false
+	}
+	return c.streamURL(itemID, token), true
+}
+
 // StreamURL returns an authenticated audio URL for a track item.
 func (c *Client) StreamURL(itemID string) string {
 	_ = c.ensureAuth()
+	return c.streamURL(itemID, c.authToken())
+}
+
+// streamURL builds a direct-download stream URL for an item, carrying both the
+// modern ApiKey and legacy api_key query parameters.
+func (c *Client) streamURL(itemID, token string) string {
+	// ApiKey is the auth query param Jellyfin reads on every version (including
+	// 10.12+/12 which disable legacy auth); api_key is the legacy alias that
+	// older servers still accept. Send both so buffered stream requests that
+	// carry no headers work on any server.
 	v := url.Values{
-		"api_key": {c.authToken()},
+		"ApiKey":  {token},
+		"api_key": {token},
 	}
 
 	// Use the direct item download route rather than the Audio controller.
@@ -489,6 +579,7 @@ func (c *Client) StreamURL(itemID string) string {
 	return u
 }
 
+// ReportNowPlaying reports the currently playing track to the server.
 func (c *Client) ReportNowPlaying(track playlist.Track, position time.Duration, canSeek bool) error {
 	return c.postJSON("/Sessions/Playing", playbackInfo{
 		CanSeek:       canSeek,
@@ -500,6 +591,8 @@ func (c *Client) ReportNowPlaying(track playlist.Track, position time.Duration, 
 	})
 }
 
+// ReportScrobble reports playback progress and a stop event for the given
+// track to the server.
 func (c *Client) ReportScrobble(track playlist.Track, elapsed time.Duration, canSeek bool) error {
 	progress := playbackInfo{
 		CanSeek:       canSeek,
@@ -519,6 +612,22 @@ func (c *Client) ReportScrobble(track playlist.Track, elapsed time.Duration, can
 	})
 }
 
+// httpError records an HTTP error response from an Emby or Jellyfin server.
+type httpError struct {
+	dialect    string
+	path       string
+	statusCode int
+	status     string
+	body       string
+}
+
+// Error returns the formatted error string without raw response bodies.
+func (e *httpError) Error() string {
+	return fmt.Sprintf("%s: %s: http status %s", e.dialect, e.path, e.status)
+}
+
+// get executes a GET request against the endpoint, unmarshaling JSON into out
+// on success and returning a typed httpError for non-200 responses.
 func (c *Client) get(p string, params url.Values, out any) error {
 	if err := c.ensureAuth(); err != nil {
 		return err
@@ -531,21 +640,28 @@ func (c *Client) get(p string, params url.Values, out any) error {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("%s: %s: %w", c.dialect.name(), p, err)
+		return fmt.Errorf("%s: %s: %w", c.dialect.name(), p, netdiag.Explain(err))
 	}
 	defer resp.Body.Close()
 
 	switch resp.StatusCode {
 	case http.StatusOK:
 	default:
-		return fmt.Errorf("%s: %s: http status %s", c.dialect.name(), p, resp.Status)
+		var bodyStr string
+		if resp.Body != nil {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			bodyStr = strings.TrimSpace(string(body))
+		}
+		return &httpError{
+			dialect:    c.dialect.name(),
+			path:       p,
+			statusCode: resp.StatusCode,
+			status:     resp.Status,
+			body:       bodyStr,
+		}
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
-	if err != nil {
-		return fmt.Errorf("%s: %s: %w", c.dialect.name(), p, err)
-	}
-	if err := json.Unmarshal(body, out); err != nil {
+	if err := httpclient.ReadJSON(resp.Body, maxResponseBody, out); err != nil {
 		return fmt.Errorf("%s: %s: %w", c.dialect.name(), p, err)
 	}
 	return nil
@@ -569,7 +685,7 @@ func (c *Client) postJSON(p string, payload any) error {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("%s: %s: %w", c.dialect.name(), p, err)
+		return fmt.Errorf("%s: %s: %w", c.dialect.name(), p, netdiag.Explain(err))
 	}
 	defer resp.Body.Close()
 
@@ -581,10 +697,13 @@ func (c *Client) postJSON(p string, payload any) error {
 }
 
 func (c *Client) ensureAuth() error {
-	c.mu.Lock()
-	have := c.token != ""
-	c.mu.Unlock()
-	if have {
+	if c.authToken() != "" {
+		return nil
+	}
+
+	c.authMu.Lock()
+	defer c.authMu.Unlock()
+	if c.authToken() != "" {
 		return nil
 	}
 	if c.user == "" || c.password == "" {
@@ -609,7 +728,7 @@ func (c *Client) ensureAuth() error {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("%s: auth: %w", c.dialect.name(), err)
+		return fmt.Errorf("%s: auth: %w", c.dialect.name(), netdiag.Explain(err))
 	}
 	defer resp.Body.Close()
 
@@ -617,13 +736,8 @@ func (c *Client) ensureAuth() error {
 		return fmt.Errorf("%s: auth: http status %s", c.dialect.name(), resp.Status)
 	}
 
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
-	if err != nil {
-		return fmt.Errorf("%s: auth: %w", c.dialect.name(), err)
-	}
-
 	var out authResponseDTO
-	if err := json.Unmarshal(data, &out); err != nil {
+	if err := httpclient.ReadJSON(resp.Body, maxResponseBody, &out); err != nil {
 		return fmt.Errorf("%s: auth: %w", c.dialect.name(), err)
 	}
 	if out.AccessToken == "" {

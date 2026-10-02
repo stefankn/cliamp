@@ -21,6 +21,12 @@ func TestIsURL(t *testing.T) {
 		{"", false},
 		{"ftp://files.example.com/song.mp3", false},
 		{"spotify:track:abc123", false},
+		// Flag-shaped inputs must never classify as URLs: everything that does
+		// reaches yt-dlp as a positional argument.
+		{"--exec=touch /tmp/pwned", false},
+		{"-o/tmp/out", false},
+		{"--config-location=/tmp/evil.conf", false},
+		{"--ytsearch:x", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.path, func(t *testing.T) {
@@ -180,6 +186,8 @@ func TestIsYTDL(t *testing.T) {
 		{"scsearch5:multi result query", true},
 		// SoundCloud
 		{"https://soundcloud.com/artist/track", true},
+		// Mixcloud
+		{"https://www.mixcloud.com/artist/show/", true},
 		// Bandcamp
 		{"https://bandcamp.com/album", true},
 		{"https://artist.bandcamp.com/album/name", true},
@@ -199,6 +207,27 @@ func TestIsYTDL(t *testing.T) {
 		t.Run(tt.path, func(t *testing.T) {
 			if got := IsYTDL(tt.path); got != tt.want {
 				t.Errorf("IsYTDL(%q) = %v, want %v", tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsMixcloudURL(t *testing.T) {
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{"https://www.mixcloud.com/creator/show/", true},
+		{"https://m.mixcloud.com/creator/show/", true},
+		{"https://mixcloud.com/creator/show/", true},
+		{"https://notmixcloud.com/creator/show/", false},
+		{"https://mixcloud.com.example/creator/show/", false},
+		{"/local/mixcloud.com/show.mp3", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			if got := IsMixcloudURL(tt.path); got != tt.want {
+				t.Errorf("IsMixcloudURL(%q) = %v, want %v", tt.path, got, tt.want)
 			}
 		})
 	}
@@ -245,6 +274,57 @@ func TestIsXiaoyuzhouEpisode(t *testing.T) {
 		t.Run(tt.path, func(t *testing.T) {
 			if got := IsXiaoyuzhouEpisode(tt.path); got != tt.want {
 				t.Errorf("IsXiaoyuzhouEpisode(%q) = %v, want %v", tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeHost(t *testing.T) {
+	tests := []struct {
+		host string
+		want string
+	}{
+		{"youtube.com", "youtube.com"},
+		{" WWW.YouTube.COM ", "youtube.com"},
+		{"m.youtube.com", "youtube.com"},
+		{"www.m.example.com", "example.com"},
+		{"m.www.example.com", "www.example.com"},
+		{"music.163.com", "music.163.com"},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.host, func(t *testing.T) {
+			if got := NormalizeHost(tt.host); got != tt.want {
+				t.Errorf("NormalizeHost(%q) = %q, want %q", tt.host, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHostOf(t *testing.T) {
+	tests := []struct {
+		path   string
+		want   string
+		wantOK bool
+	}{
+		{"https://youtube.com/watch?v=a", "youtube.com", true},
+		{"https://WWW.YouTube.COM/watch?v=a", "youtube.com", true},
+		{"https://m.youtube.com/watch?v=a", "youtube.com", true},
+		{"https://www.music.youtube.com/watch?v=a", "music.youtube.com", true},
+		{"http://example.com:8000/live", "example.com", true},
+		// Only one www. and one m. prefix go, in that order.
+		{"https://m.www.example.com/", "www.example.com", true},
+		// A search expression is a URL with no host.
+		{"ytsearch:lofi", "", true},
+		{"https://[::1/stream", "", false},
+		{"/local/youtube.com.mp3", "", false},
+		{"", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			got, _, ok := hostOf(tt.path)
+			if got != tt.want || ok != tt.wantOK {
+				t.Errorf("hostOf(%q) = %q, %v, want %q, %v", tt.path, got, ok, tt.want, tt.wantOK)
 			}
 		})
 	}

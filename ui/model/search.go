@@ -3,7 +3,7 @@ package model
 import (
 	"sort"
 
-	"cliamp/internal/fuzzy"
+	"github.com/bjarneo/cliamp/internal/fuzzy"
 )
 
 // updateSearch filters the playlist by the current search query, ranking

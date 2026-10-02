@@ -80,6 +80,26 @@ func TestParseLRCEmptyText(t *testing.T) {
 	}
 }
 
+func TestParseEmbeddedPrefersSyncedLRC(t *testing.T) {
+	lines := ParseEmbedded("[00:01.50]Hello\nplain fallback")
+	if len(lines) != 1 {
+		t.Fatalf("got %d lines, want 1 synced line", len(lines))
+	}
+	if lines[0].Start != 1500*time.Millisecond || lines[0].Text != "Hello" {
+		t.Fatalf("line = %+v, want synced Hello at 1.5s", lines[0])
+	}
+}
+
+func TestParseEmbeddedPlainText(t *testing.T) {
+	lines := ParseEmbedded("Line one\nLine two")
+	if len(lines) != 2 {
+		t.Fatalf("got %d lines, want 2", len(lines))
+	}
+	if lines[0].Start != 0 || lines[0].Text != "Line one" || lines[1].Text != "Line two" {
+		t.Fatalf("lines = %+v, want plain zero-timestamp lines", lines)
+	}
+}
+
 func TestCleanQuery(t *testing.T) {
 	tests := []struct {
 		input, want string

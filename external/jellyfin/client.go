@@ -2,14 +2,11 @@
 // to a Jellyfin server and exposes it as a playlist provider.
 package jellyfin
 
-import "cliamp/internal/embyapi"
+import "github.com/bjarneo/cliamp/internal/embyapi"
 
-// Client and Track alias the shared embyapi types so the provider layer reads
-// naturally and external callers keep using jellyfin.Client.
-type (
-	Client = embyapi.Client
-	Track  = embyapi.Track
-)
+// Client aliases the shared embyapi type so external callers keep using
+// jellyfin.Client.
+type Client = embyapi.Client
 
 // NewClient returns a Client for the given Jellyfin server URL and credentials.
 func NewClient(baseURL, token, userID, user, password string) *Client {

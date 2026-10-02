@@ -1,6 +1,9 @@
 package playlist
 
-import "testing"
+import (
+	"slices"
+	"testing"
+)
 
 func TestQueueAndDequeue(t *testing.T) {
 	p := makePlaylist(5, false)
@@ -61,6 +64,154 @@ func TestQueueTracks(t *testing.T) {
 	if qt[0].Title != "A" || qt[1].Title != "C" || qt[2].Title != "E" {
 		t.Errorf("QueueTracks = [%s, %s, %s], want [A, C, E]",
 			qt[0].Title, qt[1].Title, qt[2].Title)
+	}
+}
+
+func TestTracksAndQueue(t *testing.T) {
+	p := makePlaylist(3, false)
+	p.Queue(2)
+	p.Queue(0)
+
+	tracks, queue := p.TracksAndQueue()
+	if len(tracks) != 3 || tracks[0].Title != "A" || tracks[2].Title != "C" {
+		t.Fatalf("tracks = %+v, want A, B, C", tracks)
+	}
+	if !slices.Equal(queue, []int{2, 0}) {
+		t.Fatalf("queue = %v, want [2 0]", queue)
+	}
+	tracks[0].Title = "Changed"
+	queue[0] = 1
+	if tracks, queue := p.TracksAndQueue(); tracks[0].Title != "A" || queue[0] != 2 {
+		t.Fatalf("after a change to the returned slices: tracks[0] = %q, queue[0] = %d; want A, 2", tracks[0].Title, queue[0])
+	}
+}
+
+func TestQueueWindow(t *testing.T) {
+	p := makePlaylist(5, false)
+	for i := range 5 {
+		p.Queue(i)
+	}
+
+	tests := []struct {
+		name       string
+		start      int
+		limit      int
+		wantTitles string
+	}{
+		{name: "middle", start: 1, limit: 2, wantTitles: "BC"},
+		{name: "negative start", start: -2, limit: 2, wantTitles: "AB"},
+		{name: "limit past end", start: 3, limit: 10, wantTitles: "DE"},
+		{name: "start at end", start: 5, limit: 1},
+		{name: "zero limit", start: 0, limit: 0},
+		{name: "negative limit", start: 0, limit: -1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tracks := p.QueueWindow(tt.start, tt.limit)
+			got := ""
+			for _, track := range tracks {
+				got += track.Title
+			}
+			if got != tt.wantTitles {
+				t.Fatalf("QueueWindow(%d, %d) titles = %q, want %q", tt.start, tt.limit, got, tt.wantTitles)
+			}
+		})
+	}
+
+	window := p.QueueWindow(1, 1)
+	window[0].Title = "changed"
+	if got := p.QueueWindow(1, 1)[0].Title; got != "B" {
+		t.Fatalf("mutating QueueWindow result changed playlist title to %q", got)
+	}
+}
+
+func TestQueueOutputsOwnProviderMeta(t *testing.T) {
+	p := New()
+	p.Replace([]Track{{ProviderMeta: map[string]string{"provider.id": "original"}}})
+	p.Queue(0)
+
+	window := p.QueueWindow(0, 1)
+	window[0].ProviderMeta["provider.id"] = "window"
+	queued := p.QueueTracks()
+	queued[0].ProviderMeta["provider.id"] = "queue"
+
+	if got := p.Tracks()[0].ProviderMeta["provider.id"]; got != "original" {
+		t.Fatalf("metadata after queue output mutation = %q, want original", got)
+	}
+}
+
+func TestQueuePositionsStayCoherentAcrossMutations(t *testing.T) {
+	p := makePlaylist(5, false)
+	p.Queue(1)
+	p.Queue(3)
+	p.Queue(1)
+	p.Queue(4)
+	assertQueuePositions(t, p, map[int]int{1: 1, 3: 2, 4: 4})
+
+	if !p.MoveQueue(3, 0) {
+		t.Fatal("MoveQueue(3, 0) = false, want true")
+	}
+	assertQueuePositions(t, p, map[int]int{1: 3, 3: 2, 4: 1})
+
+	p.RemoveQueueAt(1)
+	assertQueuePositions(t, p, map[int]int{1: 2, 4: 1})
+
+	if !p.Dequeue(1) {
+		t.Fatal("Dequeue(1) = false, want true")
+	}
+	assertQueuePositions(t, p, map[int]int{1: 2, 4: 1})
+
+	if !p.Move(1, 2) {
+		t.Fatal("Move(1, 2) = false, want true")
+	}
+	assertQueuePositions(t, p, map[int]int{2: 2, 4: 1})
+	snapshot := p.Snapshot()
+
+	if !p.Remove(0) {
+		t.Fatal("Remove(0) = false, want true")
+	}
+	assertQueuePositions(t, p, map[int]int{1: 2, 3: 1})
+
+	p.ClearQueue()
+	assertQueuePositions(t, p, nil)
+	p.Restore(snapshot)
+	assertQueuePositions(t, p, map[int]int{2: 2, 4: 1})
+
+	if track, ok := p.Next(); !ok || track.Title != "E" {
+		t.Fatalf("Next() = (%q, %t), want (E, true)", track.Title, ok)
+	}
+	assertQueuePositions(t, p, map[int]int{2: 1})
+
+	p.Replace([]Track{{Title: "replacement"}})
+	assertQueuePositions(t, p, nil)
+}
+
+func assertQueuePositions(t *testing.T, p *Playlist, want map[int]int) {
+	t.Helper()
+	for idx := range p.Len() {
+		if got := p.QueuePosition(idx); got != want[idx] {
+			t.Fatalf("QueuePosition(%d) = %d, want %d", idx, got, want[idx])
+		}
+	}
+}
+
+func TestRestoreSnapshotRestoresTracksAndQueue(t *testing.T) {
+	p := makePlaylist(3, false)
+	p.Queue(0)
+	p.Queue(2)
+	snapshot := p.Snapshot()
+
+	p.Remove(0)
+	p.ClearQueue()
+	p.Restore(snapshot)
+
+	tracks := p.Tracks()
+	if len(tracks) != 3 || tracks[0].Title != "A" {
+		t.Fatalf("tracks after restore = %#v, want original tracks", tracks)
+	}
+	queued := p.QueueTracks()
+	if len(queued) != 2 || queued[0].Title != "A" || queued[1].Title != "C" {
+		t.Fatalf("queue after restore = %#v, want [A C]", queued)
 	}
 }
 

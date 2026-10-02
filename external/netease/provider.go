@@ -11,15 +11,16 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"cliamp/playlist"
-	"cliamp/provider"
-	"cliamp/resolve"
+	"github.com/bjarneo/cliamp/internal/httpclient"
+	"github.com/bjarneo/cliamp/internal/ytdlp"
+	"github.com/bjarneo/cliamp/playlist"
+	"github.com/bjarneo/cliamp/provider"
+	"github.com/bjarneo/cliamp/resolve"
 )
 
 var (
@@ -84,16 +85,14 @@ type Provider struct {
 }
 
 // NewFromConfig returns a provider, or nil when NetEase is not enabled.
-// Sets resolve's yt-dlp cookies as a side effect when CookiesFrom is non-empty
-// so URL resolution uses the same signed-in browser session.
+// Registers NetEase's yt-dlp cookie source so resolution and playback use the
+// same signed-in browser session without affecting other providers.
 func NewFromConfig(cfg Config) *Provider {
 	if !cfg.Enabled {
 		return nil
 	}
 	cfg.CookiesFrom = strings.TrimSpace(cfg.CookiesFrom)
-	if cfg.CookiesFrom != "" {
-		resolve.SetYTDLCookiesFrom(cfg.CookiesFrom)
-	}
+	resolve.SetYTDLCookiesForHost("music.163.com", cfg.CookiesFrom)
 	return New(cfg)
 }
 
@@ -101,7 +100,7 @@ func NewFromConfig(cfg Config) *Provider {
 func New(cfg Config) *Provider {
 	return &Provider{
 		apiBase:     defaultAPIBase,
-		httpClient:  &http.Client{Timeout: apiTimeout},
+		httpClient:  httpclient.NewAPI(apiTimeout),
 		cookiesFrom: strings.TrimSpace(cfg.CookiesFrom),
 		userID:      strings.TrimSpace(cfg.UserID),
 	}
@@ -437,7 +436,7 @@ func (p *Provider) ensureCookieHeader(ctx context.Context) (string, error) {
 
 func extractBrowserCookieHeader(ctx context.Context, browser string) (string, error) {
 	if _, err := exec.LookPath("yt-dlp"); err != nil {
-		return "", fmt.Errorf("yt-dlp not found. Install with: %s", ytDLPInstallHint())
+		return "", fmt.Errorf("yt-dlp not found. Install with: %s", ytdlp.InstallHint())
 	}
 	tmp, err := os.CreateTemp("", "cliamp-netease-cookies-*.txt")
 	if err != nil {
@@ -457,6 +456,7 @@ func extractBrowserCookieHeader(ctx context.Context, browser string) (string, er
 		"--playlist-end", "1",
 		"--socket-timeout", "15",
 		"--print", "title",
+		"--",
 		probeURL,
 	)
 	var stderr strings.Builder
@@ -476,25 +476,6 @@ func extractBrowserCookieHeader(ctx context.Context, browser string) (string, er
 		return "", fmt.Errorf("netease: no NetEase cookies found in browser session")
 	}
 	return header, nil
-}
-
-func ytDLPInstallHint() string {
-	switch runtime.GOOS {
-	case "darwin":
-		return "brew install yt-dlp"
-	case "linux":
-		if _, err := exec.LookPath("apt-get"); err == nil {
-			return "sudo apt install yt-dlp"
-		}
-		if _, err := exec.LookPath("pacman"); err == nil {
-			return "sudo pacman -S yt-dlp"
-		}
-		return "pip install yt-dlp"
-	case "windows":
-		return "winget install yt-dlp"
-	default:
-		return "pip install yt-dlp"
-	}
 }
 
 func cookieHeaderFromNetscapeFile(path string) (string, error) {

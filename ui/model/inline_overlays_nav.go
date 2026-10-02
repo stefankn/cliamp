@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"cliamp/ui"
+	"github.com/bjarneo/cliamp/provider"
 )
 
 // — provider browser (nav) —
@@ -16,6 +16,8 @@ const (
 	navViewArtists
 	navViewAlbums
 	navViewTracks
+	navViewGenres
+	navViewGenreSorts
 )
 
 // navView collapses the nav browser's mode + screen into the list actually
@@ -41,104 +43,133 @@ func (m Model) navView() navViewKind {
 		default:
 			return navViewArtists
 		}
+	case navBrowseModeByGenre:
+		switch m.navBrowser.screen {
+		case navBrowseScreenAlbums:
+			return navViewGenreSorts
+		case navBrowseScreenTracks:
+			return navViewTracks
+		default:
+			return navViewGenres
+		}
 	default:
 		return navViewMenu
 	}
 }
 
-func (m Model) navTrackBreadcrumb() string {
-	switch m.navBrowser.mode {
-	case navBrowseModeByArtist:
-		return "Artist: " + m.navBrowser.selArtist.Name
-	case navBrowseModeByAlbum:
-		return "Album: " + m.navBrowser.selAlbum.Name
-	case navBrowseModeByArtistAlbum:
-		return m.navBrowser.selArtist.Name + " / " + m.navBrowser.selAlbum.Name
-	}
-	return "Tracks"
-}
-
 func (m Model) navHeaderLine() string {
+	if m.navBrowser.confirmReplace {
+		return sepHeader("Replace current queue?", m.layout.panelWidth)
+	}
 	if m.navBrowser.searching {
-		return filterPromptHeader(m.navBrowser.search)
+		return m.filterHeader("Filter: "+m.navBreadcrumb(), "nav-search", m.navBrowser.search, "")
 	}
 	switch m.navView() {
 	case navViewArtists:
-		return sepHeaderN("Artists", m.navBrowser.cursor+1, len(m.navBrowser.artists))
+		return sepHeaderN(m.navBreadcrumb(), m.navBrowser.cursor+1, len(m.navBrowser.artists), m.layout.panelWidth)
 	case navViewAlbums:
-		label := "Albums"
-		if m.navBrowser.mode == navBrowseModeByArtistAlbum {
-			label = "Albums: " + m.navBrowser.selArtist.Name
-		} else if s := m.navSortLabel(m.navBrowser.sortType); s != "" {
-			label += "  Sort: " + s
-		}
-		return sepHeaderN(label, m.navBrowser.cursor+1, len(m.navBrowser.albums))
+		return sepHeaderN(m.navBreadcrumb(), m.navBrowser.cursor+1, len(m.navBrowser.albums), m.layout.panelWidth)
 	case navViewTracks:
-		return sepHeaderN(m.navTrackBreadcrumb(), m.navBrowser.cursor+1, len(m.navBrowser.tracks))
+		return sepHeaderN(m.navBreadcrumb(), m.navBrowser.cursor+1, len(m.navBrowser.tracks), m.layout.panelWidth)
+	case navViewGenres:
+		return sepHeaderN(m.navBreadcrumb(), m.navBrowser.cursor+1, len(m.navBrowser.genres), m.layout.panelWidth)
+	case navViewGenreSorts:
+		return sepHeaderN(m.navBreadcrumb(), m.navBrowser.cursor+1, len(m.navBrowser.genreSorts), m.layout.panelWidth)
 	default:
-		name := "Browse"
-		if m.navBrowser.prov != nil {
-			name = m.navBrowser.prov.Name()
-		}
-		return sepHeader(name)
+		return sepHeader(m.navBreadcrumb(), m.layout.panelWidth)
 	}
 }
 
-func (m Model) navHelpLine() string {
-	if m.navBrowser.searching {
-		return helpKey("Enter", "Confirm ") + helpKey("Esc", "Cancel ") + helpKey("Type", "Filter")
-	}
-	switch m.navView() {
-	case navViewArtists:
-		return helpKey("←↓↑→", "Navigate ") + helpKey("Enter", "Open ") + helpKey("/", "Search")
-	case navViewAlbums:
-		h := helpKey("←↓↑→", "Navigate ") + helpKey("Enter", "Open ")
-		if m.navBrowser.mode == navBrowseModeByAlbum {
-			h += helpKey("s", "Sort ")
-		}
-		return h + helpKey("/", "Search")
-	case navViewTracks:
-		return helpKey("←↓↑→", "Navigate ") + helpKey("Enter", "Play from here ") +
-			helpKey("q", "Queue ") + helpKey("R", "Replace ") + helpKey("a", "Append ") + helpKey("/", "Search")
-	default:
-		return helpKey("↓↑", "Scroll ") + helpKey("Enter", "Select ") + helpKey("Esc", "Close")
-	}
-}
-
+// renderNavBody renders the list for the active provider-browser route.
 func (m Model) renderNavBody() string {
+	labels := m.navLabels()
 	budget := m.effectivePlaylistVisible()
+	if m.navBrowser.confirmReplace {
+		return bodyMessage("Displayed tracks will replace the current queue. Enter confirms; Esc cancels.", budget)
+	}
 	switch m.navView() {
 	case navViewArtists:
 		if m.navBrowser.loading && len(m.navBrowser.artists) == 0 {
-			return bodyLines([]string{loadingLine("Loading artists…")}, budget)
+			return bodyLines([]string{loadingLine("Loading " + labels.artistsLower() + "…")}, budget)
+		}
+		if m.navBrowser.search != "" && len(m.navBrowser.searchIdx) == 0 {
+			return bodyMessage("No matches.", budget)
 		}
 		if len(m.navBrowser.artists) == 0 {
-			return bodyMessage("No artists found.", budget)
+			return bodyMessage("No "+labels.artistsLower()+" found.", budget)
 		}
 		items := m.navScrollItems(len(m.navBrowser.artists), func(i int) string {
 			a := m.navBrowser.artists[i]
-			return truncate(fmt.Sprintf("%s (%d albums)", a.Name, a.AlbumCount), ui.PanelWidth-6)
+			name := a.Name
+			if a.AlbumCount > 0 {
+				name = fmt.Sprintf("%s (%d %s)", name, a.AlbumCount, labels.albumsLower())
+			}
+			return truncate(name, m.layout.panelWidth-6)
 		})
 		return strings.Join(items, "\n")
 	case navViewAlbums:
-		if m.navBrowser.loading && len(m.navBrowser.albums) == 0 {
-			return bodyLines([]string{loadingLine("Loading albums…")}, budget)
+		if (m.navBrowser.loading || m.navBrowser.albumLoading) && len(m.navBrowser.albums) == 0 {
+			return bodyLines([]string{loadingLine("Loading " + labels.albumsLower() + "…")}, budget)
+		}
+		if m.navBrowser.search != "" && len(m.navBrowser.searchIdx) == 0 {
+			return bodyMessage("No matches.", budget)
 		}
 		if len(m.navBrowser.albums) == 0 {
-			return bodyMessage("No albums found.", budget)
+			return bodyMessage("No "+labels.albumsLower()+" found.", budget)
 		}
 		items := m.navScrollItems(len(m.navBrowser.albums), func(i int) string {
 			a := m.navBrowser.albums[i]
+			name := albumViewName(a)
 			if a.Year > 0 {
-				return truncate(fmt.Sprintf("%s — %s (%d)", a.Name, a.Artist, a.Year), ui.PanelWidth-6)
+				return truncate(fmt.Sprintf("%s — %s (%d)", name, a.Artist, a.Year), m.layout.panelWidth-6)
 			}
-			return truncate(fmt.Sprintf("%s — %s", a.Name, a.Artist), ui.PanelWidth-6)
+			return truncate(fmt.Sprintf("%s — %s", name, a.Artist), m.layout.panelWidth-6)
 		})
 		return strings.Join(items, "\n")
 	case navViewTracks:
 		return m.renderNavTrackBody(budget)
+	case navViewGenres:
+		genres := m.navLabels().genresLower()
+		if m.navBrowser.loading && len(m.navBrowser.genres) == 0 {
+			return bodyLines([]string{loadingLine("Loading " + genres + "…")}, budget)
+		}
+		if m.navBrowser.search != "" && len(m.navBrowser.searchIdx) == 0 {
+			return bodyMessage("No matches.", budget)
+		}
+		if len(m.navBrowser.genres) == 0 {
+			return bodyMessage("No "+genres+" found.", budget)
+		}
+		_, canFavorite := m.navGenreBrowser().(provider.GenreFavoriteToggler)
+		items := m.navScrollItems(len(m.navBrowser.genres), func(i int) string {
+			genre := m.navBrowser.genres[i]
+			mark := ""
+			if canFavorite {
+				mark = "☆ "
+				if genre.Favorite {
+					mark = "★ "
+				}
+			}
+			label := mark + genre.Name
+			if genre.Group != "" && !strings.EqualFold(genre.Group, "music") {
+				label += " — " + genre.Group
+			}
+			return truncate(label, m.layout.panelWidth-6)
+		})
+		return strings.Join(items, "\n")
+	case navViewGenreSorts:
+		if len(m.navBrowser.genreSorts) == 0 {
+			return bodyMessage("No views found.", budget)
+		}
+		items := m.navScrollItems(len(m.navBrowser.genreSorts), func(i int) string {
+			return truncate(m.navBrowser.genreSorts[i].Label, m.layout.panelWidth-6)
+		})
+		return strings.Join(items, "\n")
 	default:
-		items := []string{"By Album", "By Artist", "By Artist / Album"}
+		menu := m.navMenuItems()
+		items := make([]string, len(menu))
+		for i := range menu {
+			items[i] = menu[i].label
+		}
 		return windowList(items, m.navBrowser.cursor, 0, budget)
 	}
 }
@@ -150,11 +181,14 @@ func (m Model) renderNavTrackBody(budget int) string {
 	if len(m.navBrowser.tracks) == 0 {
 		return bodyMessage("No tracks found.", budget)
 	}
+	if m.navBrowser.search != "" && len(m.navBrowser.searchIdx) == 0 {
+		return bodyMessage("No matches.", budget)
+	}
 
-	if len(m.navBrowser.searchIdx) > 0 || m.navBrowser.search != "" {
+	if m.navBrowser.search != "" {
 		items := m.navScrollItems(len(m.navBrowser.tracks), func(i int) string {
 			t := m.navBrowser.tracks[i]
-			return formatTrackRow(i+1, t.DisplayName()+trackAlbumSuffix(t, m.showAlbumHeaders), t.DurationSecs)
+			return formatTrackRow(i+1, trackViewName(t)+trackAlbumSuffix(t, m.showAlbumHeaders), t.DurationSecs, m.layout.panelWidth)
 		})
 		return strings.Join(items, "\n")
 	}
@@ -165,20 +199,26 @@ func (m Model) renderNavTrackBody(budget int) string {
 // — file browser —
 
 func (m Model) fbHeaderLine() string {
-	if m.fileBrowser.searching {
-		return filterPromptHeader(m.fileBrowser.search)
+	if m.fileBrowser.confirmReplace {
+		return sepHeader("Replace current queue?", m.layout.panelWidth)
+	}
+	if m.fileBrowser.filtering {
+		return m.filterHeader("Filter: Files", "file-browser-search", m.fileBrowser.filter, "")
 	}
 	label := "Files: " + m.fileBrowser.dir
 	if n := len(m.fileBrowser.selected); n > 0 {
 		label += fmt.Sprintf("  [%d selected]", n)
 	}
-	return sepHeader(label)
+	return sepHeader(label, m.layout.panelWidth)
 }
 
 func (m Model) renderFileBrowserBody() string {
 	budget := m.effectivePlaylistVisible()
 	if budget <= 0 {
 		return ""
+	}
+	if m.fileBrowser.confirmReplace {
+		return bodyMessage("Selected files will replace the current queue. Enter confirms; Esc cancels.", budget)
 	}
 
 	var lines []string
@@ -188,7 +228,7 @@ func (m Model) renderFileBrowserBody() string {
 
 	count := m.fbCount()
 	if count == 0 {
-		if m.fileBrowser.search != "" {
+		if m.fileBrowser.filter != "" {
 			lines = append(lines, dimStyle.Render("  No matches"))
 		} else {
 			lines = append(lines, dimStyle.Render("  (empty)"))
@@ -210,10 +250,10 @@ func (m Model) renderFileBrowserBody() string {
 		if e.isAudio {
 			suffix = " ♫"
 		}
-		label := truncate(check+e.name+suffix, max(1, ui.PanelWidth-2))
+		label := truncate(check+e.name+suffix, max(1, m.layout.panelWidth-2))
 
 		switch {
-		case m.fileBrowser.searching:
+		case m.fileBrowser.filtering:
 			lines = append(lines, dimStyle.Render("  "+label))
 		case i == m.fileBrowser.cursor:
 			lines = append(lines, playlistSelectedStyle.Render("> "+label))

@@ -2,13 +2,15 @@
 package plex
 
 import (
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/bjarneo/cliamp/internal/httpclient"
+	"github.com/bjarneo/cliamp/internal/netdiag"
 )
 
 // maxResponseBody limits API responses to 10 MB to prevent unbounded memory growth.
@@ -16,7 +18,7 @@ const maxResponseBody = 10 << 20
 
 // apiClient is used for all Plex API calls with a finite timeout.
 // It is distinct from httpclient.Streaming (which has no timeout) used for audio streams.
-var apiClient = &http.Client{Timeout: 30 * time.Second}
+var apiClient = httpclient.NewAPI(30 * time.Second)
 
 // Client speaks to a Plex Media Server over its HTTP API.
 type Client struct {
@@ -60,6 +62,15 @@ type Track struct {
 	PartKey     string // relative path, e.g. "/library/parts/67890/1234567890/file.flac"
 }
 
+// Playlist represents a Plex playlist (smart or user-created) of audio tracks.
+type Playlist struct {
+	RatingKey    string
+	Title        string
+	TrackCount   int // leafCount
+	DurationSecs int // duration, converted from milliseconds
+	Smart        bool
+}
+
 // get issues an authenticated GET request and decodes the JSON response into result.
 func (c *Client) get(path string, params url.Values, result any) error {
 	if params == nil {
@@ -77,7 +88,7 @@ func (c *Client) get(path string, params url.Values, result any) error {
 
 	resp, err := apiClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("plex: %s: server unreachable: %w", path, err)
+		return fmt.Errorf("plex: %s: server unreachable: %w", path, netdiag.Explain(err))
 	}
 	defer resp.Body.Close()
 
@@ -90,11 +101,10 @@ func (c *Client) get(path string, params url.Values, result any) error {
 		return fmt.Errorf("plex: %s: HTTP %s", path, resp.Status)
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
-	if err != nil {
+	if err := httpclient.ReadJSON(resp.Body, maxResponseBody, result); err != nil {
 		return fmt.Errorf("plex: %s: %w", path, err)
 	}
-	return json.Unmarshal(body, result)
+	return nil
 }
 
 // Ping checks that the server is reachable and the token is valid.
@@ -157,13 +167,19 @@ func (c *Client) includeLibrary(title string) bool {
 // server may return as few as one item.
 const pageSize = 300
 
+// maxPages stops a paging loop if a server never sends an empty page and
+// omits totalSize.
+const maxPages = 1000
+
 // Albums returns all albums in the given music section (identified by its key).
 // It requests type=9 (album) directly rather than walking artists, and paginates
 // through the full result set using X-Plex-Container-Start / Size.
 func (c *Client) Albums(sectionKey string) ([]Album, error) {
 	type albumPage struct {
 		MediaContainer struct {
-			TotalSize int `json:"totalSize"`
+			// TotalSize is a pointer so a server that omits it is
+			// distinguishable from one that reports zero.
+			TotalSize *int `json:"totalSize"`
 			Metadata  []struct {
 				RatingKey   string `json:"ratingKey"`
 				Title       string `json:"title"`
@@ -175,7 +191,8 @@ func (c *Client) Albums(sectionKey string) ([]Album, error) {
 	}
 
 	var albums []Album
-	for offset := 0; ; offset += pageSize {
+	var prevFirstKey string
+	for offset, n := 0, 0; n < maxPages; n++ {
 		params := url.Values{
 			"type":                   {"9"}, // 9 = album
 			"X-Plex-Container-Start": {fmt.Sprintf("%d", offset)},
@@ -184,6 +201,15 @@ func (c *Client) Albums(sectionKey string) ([]Album, error) {
 		var page albumPage
 		if err := c.get("/library/sections/"+sectionKey+"/all", params, &page); err != nil {
 			return nil, err
+		}
+		// A page that starts with the album that started the page before
+		// it means that the server ignored the start. Each further page
+		// would repeat the first one.
+		if md := page.MediaContainer.Metadata; len(md) > 0 {
+			if md[0].RatingKey != "" && md[0].RatingKey == prevFirstKey {
+				return nil, fmt.Errorf("plex: section %s albums: server ignored X-Plex-Container-Start %d", sectionKey, offset)
+			}
+			prevFirstKey = md[0].RatingKey
 		}
 		for _, m := range page.MediaContainer.Metadata {
 			albums = append(albums, Album{
@@ -194,12 +220,114 @@ func (c *Client) Albums(sectionKey string) ([]Album, error) {
 				TrackCount: m.LeafCount,
 			})
 		}
-		// Stop when we've fetched everything.
-		if offset+pageSize >= page.MediaContainer.TotalSize {
+		// Advance by what the server actually returned, not by what was
+		// asked for: Plex may answer with fewer items than pageSize.
+		count := len(page.MediaContainer.Metadata)
+		if count == 0 {
+			break
+		}
+		offset += count
+		if page.MediaContainer.TotalSize != nil && offset >= *page.MediaContainer.TotalSize {
 			break
 		}
 	}
 	return albums, nil
+}
+
+// Playlists returns all audio playlists on the server. Smart playlists and
+// user-created playlists are both included; non-audio playlists (video, photo)
+// are filtered out. The Plex JSON API returns playlist entries under
+// MediaContainer.Metadata, each carrying a "type" of "playlist".
+func (c *Client) Playlists() ([]Playlist, error) {
+	var result struct {
+		MediaContainer struct {
+			Metadata []struct {
+				RatingKey    string `json:"ratingKey"`
+				Title        string `json:"title"`
+				Smart        bool   `json:"smart"`
+				PlaylistType string `json:"playlistType"`
+				LeafCount    int    `json:"leafCount"`
+				Duration     int    `json:"duration"`
+			} `json:"Metadata"`
+		} `json:"MediaContainer"`
+	}
+	if err := c.get("/playlists", nil, &result); err != nil {
+		return nil, fmt.Errorf("plex: list playlists: %w", err)
+	}
+
+	var playlists []Playlist
+	for _, m := range result.MediaContainer.Metadata {
+		if m.PlaylistType != "audio" {
+			continue
+		}
+		playlists = append(playlists, Playlist{
+			RatingKey:    m.RatingKey,
+			Title:        m.Title,
+			TrackCount:   m.LeafCount,
+			DurationSecs: m.Duration / 1000,
+			Smart:        m.Smart,
+		})
+	}
+	return playlists, nil
+}
+
+// playlistPageSize is the number of playlist items requested per API call.
+// Playlists can contain tens of thousands of tracks, so a larger page keeps
+// the request count low while staying well under the 10 MB response cap.
+const playlistPageSize = 1000
+
+// PlaylistTracks returns all tracks in the given playlist (identified by its
+// ratingKey). Playlist items share the track JSON shape, so trackFromJSON is
+// reused. Results are paginated with X-Plex-Container-Start / Size.
+func (c *Client) PlaylistTracks(playlistRatingKey string) ([]Track, error) {
+	type trackPage struct {
+		MediaContainer struct {
+			TotalSize *int `json:"totalSize"`
+			Metadata  []struct {
+				trackJSON
+				// PlaylistItemID tells two entries of one track apart.
+				PlaylistItemID int64 `json:"playlistItemID"`
+			} `json:"Metadata"`
+		} `json:"MediaContainer"`
+	}
+
+	var tracks []Track
+	var prevFirstKey string
+	for offset, n := 0, 0; n < maxPages; n++ {
+		params := url.Values{
+			"X-Plex-Container-Start": {fmt.Sprintf("%d", offset)},
+			"X-Plex-Container-Size":  {fmt.Sprintf("%d", playlistPageSize)},
+		}
+		var page trackPage
+		if err := c.get("/playlists/"+playlistRatingKey+"/items", params, &page); err != nil {
+			return nil, fmt.Errorf("plex: playlist %s items: %w", playlistRatingKey, err)
+		}
+		// A playlist can hold one track twice, so the entry ID marks the
+		// first item when the server sends it. A repeated first item means
+		// that the server ignored the start.
+		if md := page.MediaContainer.Metadata; len(md) > 0 {
+			key := md[0].RatingKey
+			if md[0].PlaylistItemID != 0 {
+				key = strconv.FormatInt(md[0].PlaylistItemID, 10)
+			}
+			if key != "" && key == prevFirstKey {
+				return nil, fmt.Errorf("plex: playlist %s items: server ignored X-Plex-Container-Start %d", playlistRatingKey, offset)
+			}
+			prevFirstKey = key
+		}
+		for _, m := range page.MediaContainer.Metadata {
+			tracks = append(tracks, trackFromJSON(m.trackJSON))
+		}
+		count := len(page.MediaContainer.Metadata)
+		if count == 0 {
+			break
+		}
+		offset += count
+		if page.MediaContainer.TotalSize != nil && offset >= *page.MediaContainer.TotalSize {
+			break
+		}
+	}
+	return tracks, nil
 }
 
 // Tracks returns all tracks in the given album (identified by its ratingKey).
