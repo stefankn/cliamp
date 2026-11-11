@@ -27,6 +27,22 @@ The provider pane lists two sections:
 Finch tracks are finite files. cliamp buffers them, so seeking and gapless
 playback work.
 
+## Radio
+
+Set `radio_url` to the address of the Finch radio:
+
+```toml
+[finch]
+url = "http://192.168.0.250:25520"
+radio_url = "http://192.168.0.250:25521"
+```
+
+When you play a stream from that host and port, such as its HLS playlist,
+cliamp polls `radio_url` + `/api/now-playing` every 5 seconds and shows the
+track as `Artist - Title`. When no track plays, it shows the show title. A new
+title appears at `started_at` plus `delay_seconds`, when the listener hears
+the track. `radio_url` works without `url`.
+
 ## Limits
 
 - There is no search. `Ctrl+F` searches YouTube while Finch is active.

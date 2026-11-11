@@ -17,6 +17,7 @@ func TestLoadFinchSection(t *testing.T) {
 	data := []byte(`
 [finch]
 url = "https://finch.example.com"
+radio_url = "http://finch.example.com:25521"
 `)
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
@@ -28,6 +29,9 @@ url = "https://finch.example.com"
 	}
 	if cfg.Finch.URL != "https://finch.example.com" {
 		t.Fatalf("URL = %q, want https://finch.example.com", cfg.Finch.URL)
+	}
+	if cfg.Finch.RadioURL != "http://finch.example.com:25521" {
+		t.Fatalf("RadioURL = %q, want http://finch.example.com:25521", cfg.Finch.RadioURL)
 	}
 	if !cfg.Finch.IsSet() {
 		t.Fatal("IsSet() = false, want true")

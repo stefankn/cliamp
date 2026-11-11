@@ -377,7 +377,7 @@ func TestLoadGolden(t *testing.T) {
 		Password:  "secret",
 		Libraries: []string{"Audiobooks", "Podcasts"},
 	}
-	allWant.Finch = FinchConfig{URL: "https://finch.example.com"}
+	allWant.Finch = FinchConfig{URL: "https://finch.example.com", RadioURL: "https://finch.example.com:25521"}
 
 	listsWant := defaultConfig()
 	listsWant.EQ = [10]float64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}

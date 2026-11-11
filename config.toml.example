@@ -340,6 +340,8 @@ eq = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 # Albums, playlists, DJ mixes and single tracks from your own Finch server.
 # [finch]
 # url = "https://finch.example.com"
+# Finch radio address. A stream played from it shows the now-playing track.
+# radio_url = "https://finch.example.com:25521"
 
 # Destination for TUI Ctrl+S saves. Empty uses ~/Music/cliamp.
 # Use an absolute path; mount external drives before saving.

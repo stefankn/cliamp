@@ -32,7 +32,7 @@ cliamp "https://example.com/live/playlist.m3u8"
 
 cliamp passes the URL to ffmpeg. ffmpeg resolves relative chunklist and segment URIs and follows the live segment window. This requires `ffmpeg`, which AAC and Opus also require.
 
-Live HLS uses timed metadata, not inline ICY. cliamp does not update the now-playing track title for HLS streams.
+Live HLS uses timed metadata, not inline ICY. cliamp does not read it, so the now-playing track title of an HLS stream updates only for stations whose now-playing API cliamp knows: NTS, FIP and a [Finch radio](finch.md#radio).
 
 ## Podcasts
 

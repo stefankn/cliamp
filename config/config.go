@@ -705,7 +705,8 @@ func (a *AudiobookshelfConfig) set(key, val string) {
 // FinchConfig holds the address of a Finch server.
 // Enable rule: credentials. Finch needs only url.
 type FinchConfig struct {
-	URL string // e.g. "https://finch.example.com"
+	URL      string // e.g. "https://finch.example.com"
+	RadioURL string // optional radio origin that serves /api/now-playing
 }
 
 // IsSet reports whether the Finch provider is configured.
@@ -715,8 +716,11 @@ func (f FinchConfig) IsSet() bool {
 
 // set applies one key of the [finch] section.
 func (f *FinchConfig) set(key, val string) {
-	if key == "url" {
+	switch key {
+	case "url":
 		f.URL = parseString(val)
+	case "radio_url":
+		f.RadioURL = parseString(val)
 	}
 }
 

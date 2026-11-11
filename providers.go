@@ -2,12 +2,14 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"runtime"
 	"strings"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -56,6 +58,9 @@ type providerSet struct {
 	favorites      *favorites.Store
 	history        *history.Store
 	radioFavorites *radio.Favorites
+	// finchRadio pulls now-playing for the Finch radio. It is nil when
+	// [finch] radio_url is not set.
+	finchRadio player.StreamMetadataResolver
 }
 
 // providerKey is one provider that --provider and the provider config key
@@ -200,6 +205,7 @@ func buildProviders(cfg config.Config, interactive bool) *providerSet {
 	if p := finch.NewFromConfig(cfg.Finch); p != nil {
 		add("finch", p)
 	}
+	s.finchRadio = finch.NowPlayingResolver(cfg.Finch)
 	if cfg.Spotify.IsSet() {
 		clientID := cfg.Spotify.ResolveClientID(spotify.DefaultClientID)
 		add("spotify", spotify.New(nil, clientID, cfg.Spotify.Bitrate))
@@ -419,8 +425,25 @@ func (s *providerSet) registerPlayerHooks(p *player.Player) {
 	p.RegisterBufferedURLMatcher(isBufferedProviderURL)
 	p.RegisterYTDLMatcher(playlist.IsYTDL)
 
-	// Pull now-playing for stations that carry no inline ICY metadata (NTS, FIP).
-	p.RegisterStreamMetadataResolver(radiometa.Resolver)
+	// Pull now-playing for stations that carry no inline ICY metadata: the
+	// Finch radio when it is configured, then NTS and FIP.
+	p.RegisterStreamMetadataResolver(chainStreamMetadata(s.finchRadio, radiometa.Resolver))
+}
+
+// chainStreamMetadata returns a resolver that asks each non-nil resolver in
+// turn and returns the first match.
+func chainStreamMetadata(resolvers ...player.StreamMetadataResolver) player.StreamMetadataResolver {
+	return func(streamURL string) (func(context.Context) (string, error), time.Duration, bool) {
+		for _, r := range resolvers {
+			if r == nil {
+				continue
+			}
+			if fetch, interval, ok := r(streamURL); ok {
+				return fetch, interval, true
+			}
+		}
+		return nil, 0, false
+	}
 }
 
 // isBufferedProviderURL reports whether u is a provider stream endpoint that
