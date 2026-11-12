@@ -276,7 +276,7 @@ func (m *Model) handleProviderPaneKey(msg tea.KeyPressMsg) tea.Cmd {
 	switch msg.String() {
 	case "q":
 		return m.quit()
-	case "F":
+	case "U":
 		m.openSubsOverlay()
 	case "l":
 		return m.loadLatestFromProviderList()
@@ -622,7 +622,7 @@ func (m *Model) handleMainKey(msg tea.KeyPressMsg) tea.Cmd {
 			m.queue.scroll = 0
 		}
 
-	case "F":
+	case "U":
 		m.openSubsOverlay()
 
 	case "ctrl+s":

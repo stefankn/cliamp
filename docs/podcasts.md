@@ -82,7 +82,7 @@ reason is in the log.
 
 ## Subscribed Shows Overlay
 
-Press `F` to list your subscriptions. The list comes from the local store, so
+Press `U` to list your subscriptions. The list comes from the local store, so
 it opens without a network call and works for shows Apple's directory does not
 carry.
 

@@ -342,11 +342,11 @@ func (m *Model) providerShortcut(key string) (cmd tea.Cmd, ok bool) {
 func providerKeyForShortcut(key string) string {
 	switch key {
 	case "S":
-		return "spotify"
+		return "soundcloud"
 	case "N":
 		return "navidrome"
 	case "P":
-		return "plex"
+		return "podcast"
 	case "J":
 		return "jellyfin"
 	case "E":
@@ -371,6 +371,8 @@ func providerKeyForShortcut(key string) string {
 		return "radio"
 	case "O":
 		return "podcast"
+	case "F":
+		return "finch"
 	}
 	return ""
 }

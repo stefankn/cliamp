@@ -19,7 +19,7 @@ func shortcutTestModel() Model {
 	m.provider = other
 	m.providers = []provider.Entry{{Key: "other", Name: "Other", Provider: other}}
 	for _, key := range []string{"navidrome", "spotify", "plex", "jellyfin", "emby", "audiobookshelf",
-		"yt", "soundcloud", "mixcloud", "netease", "qobuz", "tidal", "local", "radio", "podcast"} {
+		"yt", "soundcloud", "mixcloud", "netease", "qobuz", "tidal", "local", "radio", "podcast", "finch"} {
 		m.providers = append(m.providers, provider.Entry{Key: key, Name: key, Provider: commandsTestProvider{name: key}})
 	}
 	return m
@@ -36,9 +36,9 @@ func TestProviderShortcutsSwitchFromEveryFocus(t *testing.T) {
 		{"volume", focusVolume},
 	}
 	shortcuts := map[string]string{
-		"S": "spotify", "P": "plex", "J": "jellyfin", "E": "emby", "B": "audiobookshelf",
+		"S": "soundcloud", "P": "podcast", "J": "jellyfin", "E": "emby", "B": "audiobookshelf",
 		"Y": "yt", "C": "soundcloud", "X": "mixcloud", "M": "netease", "Q": "qobuz",
-		"T": "tidal", "L": "local", "R": "radio", "O": "podcast",
+		"T": "tidal", "L": "local", "R": "radio", "O": "podcast", "F": "finch",
 	}
 	for _, f := range focuses {
 		for key, want := range shortcuts {
@@ -88,7 +88,7 @@ func TestQuickSwitchProviderTakesEveryShortcut(t *testing.T) {
 		wantCmd      bool
 		wantProvider string
 	}{
-		{name: "configured provider", key: "S", wantOK: true, wantCmd: true, wantProvider: "spotify"},
+		{name: "configured provider", key: "S", wantOK: true, wantCmd: true, wantProvider: "soundcloud"},
 		{name: "N names Navidrome", key: "N", wantOK: true, wantCmd: true, wantProvider: "navidrome"},
 		{name: "switch with no command", key: "R", wantOK: true, wantProvider: "Radio"},
 		{name: "provider not configured", key: "T", drop: "tidal", wantOK: true, wantProvider: "Other"},
@@ -167,11 +167,11 @@ func TestOverlayProviderShortcuts(t *testing.T) {
 		{name: "nav menu N without Navidrome", open: nav(navBrowseModeMenu, navBrowseScreenList), key: "N", drop: "navidrome", wantProvider: "Other"},
 		{name: "nav album list R switches to Radio", open: nav(navBrowseModeByAlbum, navBrowseScreenList), key: "R", wantProvider: "radio"},
 		{name: "nav track screen R asks to replace", open: nav(navBrowseModeByAlbum, navBrowseScreenTracks), key: "R", wantProvider: "Other", wantOpen: true, wantReplace: true},
-		{name: "nav S without Spotify", open: nav(navBrowseModeByAlbum, navBrowseScreenList), key: "S", drop: "spotify", wantProvider: "Other"},
+		{name: "nav S without SoundCloud", open: nav(navBrowseModeByAlbum, navBrowseScreenList), key: "S", drop: "soundcloud", wantProvider: "Other"},
 		{name: "nav replace prompt keeps S", open: navPrompt, key: "S", wantProvider: "Other", wantOpen: true, wantReplace: true},
-		{name: "nav replace prompt keeps S without Spotify", open: navPrompt, key: "S", drop: "spotify", wantProvider: "Other", wantOpen: true, wantReplace: true},
+		{name: "nav replace prompt keeps S without SoundCloud", open: navPrompt, key: "S", drop: "soundcloud", wantProvider: "Other", wantOpen: true, wantReplace: true},
 		{name: "manager list R switches to Radio", open: manager(plMgrScreenList), key: "R", wantProvider: "radio"},
-		{name: "manager tracks S without Spotify", open: manager(plMgrScreenTracks), key: "S", drop: "spotify", wantProvider: "Other"},
+		{name: "manager tracks S without SoundCloud", open: manager(plMgrScreenTracks), key: "S", drop: "soundcloud", wantProvider: "Other"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

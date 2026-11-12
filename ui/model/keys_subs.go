@@ -148,7 +148,7 @@ func (m *Model) handleSubsKey(msg tea.KeyPressMsg) tea.Cmd {
 		return m.loadSubscription(subsLoadLatest)
 	case "L":
 		return m.loadLatestFromAllSubscriptions()
-	case "esc", "F":
+	case "esc", "U":
 		m.subs.visible = false
 	}
 	return nil

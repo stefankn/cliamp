@@ -14,7 +14,7 @@ url = "https://finch.example.com"
 The provider starts when `url` is set. Finch needs no credentials.
 
 Open it at start with `provider = "finch"` in the config, or with
-`cliamp --provider finch`.
+`cliamp --provider finch`. Press `F` to switch to it while cliamp runs.
 
 ## What you can play
 
